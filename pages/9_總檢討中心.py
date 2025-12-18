@@ -16,7 +16,6 @@ def sb():
 
 
 def _human_api_error(e: Exception) -> str:
-    # Supabase v2 / postgrest 的錯誤內容通常在 e.args 或 e.message
     try:
         if hasattr(e, "args") and e.args:
             return str(e.args[0])
@@ -25,10 +24,8 @@ def _human_api_error(e: Exception) -> str:
     return str(e)
 
 
-def load_audit_runs_no_cache(limit: int = 500):
-    """不使用 cache，避免錯誤被固定"""
+def load_audit_runs_no_cache(limit: int = 1000):
     client = sb()
-    # 明確指定 public schema 的表：audit_runs
     return (
         client.schema("public")
         .table("audit_runs")
@@ -48,15 +45,23 @@ def download_from_storage(object_path: str) -> bytes:
 
 
 def self_check():
-    """在畫面上做環境自檢，方便你一次定位問題"""
     card_open("🧪 Supabase 連線自檢")
-    st.write("SUPABASE_URL：", st.secrets.get("SUPABASE_URL", "")[:40] + "..." if st.secrets.get("SUPABASE_URL") else "（未設定）")
+    st.write(
+        "SUPABASE_URL：",
+        st.secrets.get("SUPABASE_URL", "")[:40] + "..."
+        if st.secrets.get("SUPABASE_URL")
+        else "（未設定）",
+    )
     st.write("SUPABASE_BUCKET：", st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports"))
-    st.write("KEY 前綴：", (st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")[:12] + "...") if st.secrets.get("SUPABASE_SERVICE_ROLE_KEY") else "（未設定）")
+    st.write(
+        "KEY 前綴：",
+        (st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")[:12] + "...")
+        if st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+        else "（未設定）",
+    )
 
     try:
         client = sb()
-        # 用最小查詢測試 table 是否存在/可讀
         _ = (
             client.schema("public")
             .table("audit_runs")
@@ -79,11 +84,8 @@ def self_check():
 
 def main():
     set_page("總檢討中心", icon="📊")
-
-    # 先自檢，避免你一直看到紅字但不知道原因
     self_check()
 
-    # 讀取資料（不 cache）
     try:
         rows = load_audit_runs_no_cache(limit=1000)
     except APIError as e:
@@ -98,30 +100,18 @@ def main():
     df = pd.DataFrame(rows)
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
-    # 轉台北時區（若原本是 tz-aware）
-    try:
-        if df["created_at"].dt.tz is not None:
-            df["created_at"] = df["created_at"].dt.tz_convert("Asia/Taipei")
-        else:
-            # 若是 tz-naive，當作 UTC 再轉（避免亂）
-            df["created_at"] = df["created_at"].dt.tz_localize("UTC").dt.tz_convert("Asia/Taipei")
-    except Exception:
-        pass
-
-    # ========== Sidebar filters ==========
+    # ========== Filters ==========
     with st.sidebar:
         st.header("🔍 篩選條件")
-
         min_d = df["created_at"].dt.date.min()
         max_d = df["created_at"].dt.date.max()
-
         date_range = st.date_input("執行日期區間", value=(min_d, max_d))
 
         ops = sorted([x for x in df.get("operator", pd.Series([])).dropna().unique()])
         operator = st.selectbox("執行人", options=["全部"] + ops)
 
-        app_names = sorted([x for x in df.get("app_name", pd.Series([])).dropna().unique()])
-        app_name = st.selectbox("功能", options=["全部"] + app_names)
+        apps = sorted([x for x in df.get("app_name", pd.Series([])).dropna().unique()])
+        app_name = st.selectbox("功能", options=["全部"] + apps)
 
     mask = (df["created_at"].dt.date >= date_range[0]) & (df["created_at"].dt.date <= date_range[1])
     if operator != "全部":
@@ -130,14 +120,12 @@ def main():
         mask &= df["app_name"] == app_name
 
     df_f = df[mask].copy()
-
     if df_f.empty:
         st.warning("篩選後沒有資料。")
         return
 
-    # ========== KPI 趨勢（上午/下午） ==========
+    # ========== KPI Trend ==========
     card_open("📈 KPI 歷史趨勢（上午 vs 下午）")
-
     kpi_rows = []
     for _, r in df_f.iterrows():
         for seg in ["am", "pm"]:
@@ -146,23 +134,20 @@ def main():
                 {
                     "時間": r["created_at"],
                     "時段": "上午" if seg == "am" else "下午",
-                    "人數": k.get("people"),
-                    "總筆數": k.get("total_cnt"),
-                    "總工時": k.get("total_hours"),
                     "平均效率": k.get("avg_eff"),
                     "達標率": k.get("pass_rate"),
+                    "總工時": k.get("total_hours"),
+                    "總筆數": k.get("total_cnt"),
+                    "人數": k.get("people"),
                 }
             )
     kpi_df = pd.DataFrame(kpi_rows).sort_values("時間")
-
-    # Streamlit 內建 line_chart 支援簡單欄位
     st.line_chart(kpi_df, x="時間", y="平均效率", color="時段")
-
     card_close()
 
-    # ========== 紀錄清單 ==========
+    # ========== Runs Table ==========
     card_open("📄 執行紀錄")
-    show_cols = ["created_at", "operator", "source_filename", "app_name", "id"]
+    show_cols = ["created_at", "operator", "source_filename", "app_name", "id", "export_object_path"]
     for c in show_cols:
         if c not in df_f.columns:
             df_f[c] = None
@@ -175,6 +160,7 @@ def main():
                 "source_filename": "來源檔案",
                 "app_name": "功能",
                 "id": "紀錄ID",
+                "export_object_path": "報表路徑",
             }
         ),
         use_container_width=True,
@@ -182,9 +168,8 @@ def main():
     )
     card_close()
 
-    # ========== 下載 Excel ==========
+    # ========== Download ==========
     card_open("⬇️ 下載歷史報表（當次匯出 Excel）")
-
     idxs = df_f.index.tolist()
     selected = st.selectbox(
         "選擇一筆紀錄",
@@ -211,7 +196,6 @@ def main():
                 st.code(str(e))
     else:
         st.warning("此筆紀錄沒有留存 Excel（export_object_path 為空）。")
-
     card_close()
 
 
