@@ -169,10 +169,9 @@ def main():
     with col2:
         st.warning("⚠️ 刪除為不可逆操作（DB + Storage）")
         confirm = st.checkbox("我已確認要刪除此筆紀錄")
-        keyword = st.text_input("輸入 DELETE 以解鎖", value="")
         pwd = st.text_input("輸入本月刪除密碼", type="password")
 
-        unlocked = confirm and keyword.strip().upper() == "DELETE" and pwd == expected_pwd
+        unlocked = confirm and pwd == expected_pwd
 
         if st.button("🗑️ 刪除紀錄", disabled=not unlocked, type="primary", use_container_width=True):
             try:
