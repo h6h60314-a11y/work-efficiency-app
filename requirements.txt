@@ -2,3 +2,4 @@ streamlit>=1.36
 pandas
 openpyxl
 plotly
+xlrd>=2.0.1
