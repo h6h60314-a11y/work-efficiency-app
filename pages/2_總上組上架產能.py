@@ -22,16 +22,17 @@ from audit_store import sha256_bytes, upload_export_bytes, insert_audit_run
 
 
 # =========================
-# 依照你 v8.9 檔案的規則
+# 依照你檔案規則（上架 v8.9）
 # =========================
 TO_EXCLUDE_KEYWORDS = ["CGS", "JCPL", "QC99", "GREAT0001X", "GX010", "PD99"]
 TO_EXCLUDE_PATTERN = re.compile("|".join(re.escape(k) for k in TO_EXCLUDE_KEYWORDS), flags=re.IGNORECASE)
 
 INPUT_USER_CANDIDATES = ["記錄輸入人", "記錄輸入者", "建立人", "輸入人"]
-REV_DT_CANDIDATES = ["修訂日期", "修訂時間", "修訂日", "異動時間", "修改時間"]
+REV_DT_CANDIDATES = ["修訂日期", "修訂時間", "修訂日", "異動時間", "修改時間", "修訂日期時間", "修訂日期時間(系統)"]
 
 TARGET_EFF = 20
 IDLE_MIN_THRESHOLD = 10
+
 AM_START, AM_END = dt.time(7, 0, 0), dt.time(12, 30, 0)
 PM_START, PM_END = dt.time(13, 30, 0), dt.time(23, 59, 59)
 
@@ -46,6 +47,7 @@ NAME_MAP = {
     "11399": "陳哲沅",
 }
 
+# 下午（或整體）扣休規則：依「首筆時間」「末筆時間」命中
 BREAK_RULES = [
     (dt.time(20,45,0), dt.time(22,30,0),  0, "首≥20:45 且 末≤22:30 → 0 分鐘"),
     (dt.time(18,30,0), dt.time(20,30,0),  0, "首≥18:30 且 末≤20:30 → 0 分鐘"),
@@ -68,6 +70,7 @@ BREAK_RULES = [
     (dt.time( 8, 0,0), dt.time(23, 0,0),135, "首≥08:00 且 末≤23:00 → 135 分鐘"),
 ]
 
+# 空窗固定帶：先扣掉（不計入空窗）
 EXCLUDE_IDLE_RANGES = [
     (dt.time(10, 0, 0), dt.time(10, 15, 0)),
     (dt.time(12,30, 0), dt.time(13, 30, 0)),
@@ -78,32 +81,65 @@ EXCLUDE_IDLE_RANGES = [
 
 
 # =========================
-# 工具
+# 讀檔（支援 xlsx/xlsm/xls/csv）
+# =========================
+def read_excel_any_quiet_bytes(name: str, content: bytes) -> Dict[str, pd.DataFrame]:
+    ext = (name.split(".")[-1] or "").lower()
+
+    if ext in ("xlsx", "xlsm"):
+        xl = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+        return {sn: pd.read_excel(xl, sheet_name=sn) for sn in xl.sheet_names}
+
+    # ✅ 舊版 .xls：需要 requirements.txt 安裝 xlrd==2.0.1
+    if ext == "xls":
+        xl = pd.ExcelFile(io.BytesIO(content), engine="xlrd")
+        return {sn: pd.read_excel(xl, sheet_name=sn) for sn in xl.sheet_names}
+
+    if ext == "csv":
+        for enc in ("utf-8-sig", "cp950", "big5"):
+            try:
+                return {"CSV": pd.read_csv(io.BytesIO(content), encoding=enc)}
+            except Exception:
+                continue
+        raise Exception("CSV 讀取失敗（請確認編碼）。")
+
+    raise Exception("目前僅支援 .xlsx/.xlsm/.xls/.csv")
+
+
+# =========================
+# 規則工具
 # =========================
 def _strip_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
+
 def find_first_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {str(c).strip(): c for c in df.columns}
+    cols = [str(c).strip() for c in df.columns]
+    s = set(cols)
     for name in candidates:
-        if name in cols:
+        if name in s:
             return name
-    norm = {re.sub(r"[（）\(\)\s]", "", k): k for k in cols}
+
+    # 去掉括號/空白做容錯
+    norm_map = {re.sub(r"[（）\(\)\s]", "", c): c for c in cols}
     for name in candidates:
         key = re.sub(r"[（）\(\)\s]", "", name)
-        if key in norm:
-            return norm[key]
+        if key in norm_map:
+            return norm_map[key]
     return None
+
 
 def normalize_to_qc(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip().str.upper()
     return s.eq("QC")
 
+
 def to_not_excluded_mask(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
     return ~s.str.contains(TO_EXCLUDE_PATTERN, na=False)
+
 
 def prepare_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -112,6 +148,7 @@ def prepare_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     if "由" not in df.columns or "到" not in df.columns:
         return pd.DataFrame()
     return df[normalize_to_qc(df["由"]) & to_not_excluded_mask(df["到"])].copy()
+
 
 def break_minutes_for_span(first_dt: pd.Timestamp, last_dt: pd.Timestamp) -> Tuple[int, str]:
     if pd.isna(first_dt) or pd.isna(last_dt):
@@ -122,8 +159,9 @@ def break_minutes_for_span(first_dt: pd.Timestamp, last_dt: pd.Timestamp) -> Tup
             return int(mins), str(tag)
     return 0, "未命中規則"
 
+
 def _subtract_exclusions(s_dt: pd.Timestamp, e_dt: pd.Timestamp, exclude_ranges):
-    # v8.9 修正版本：完整切掉重疊部分
+    """把重疊部分完整切掉（避免重疊錯留）"""
     if s_dt >= e_dt or not exclude_ranges:
         return [(s_dt, e_dt)]
     segments = [(s_dt, e_dt)]
@@ -141,6 +179,7 @@ def _subtract_exclusions(s_dt: pd.Timestamp, e_dt: pd.Timestamp, exclude_ranges)
                     new_segments.append((ex_e, b))
         segments = [(x, y) for (x, y) in new_segments if x < y]
     return segments
+
 
 def _compute_idle(series_dt: pd.Series, min_minutes=IDLE_MIN_THRESHOLD, exclude_ranges=EXCLUDE_IDLE_RANGES) -> Tuple[int, str]:
     if series_dt.size < 2:
@@ -160,10 +199,16 @@ def _compute_idle(series_dt: pd.Series, min_minutes=IDLE_MIN_THRESHOLD, exclude_
         prev = cur
     return int(total_min), "；".join(ranges_txt)
 
+
 def _span_metrics(series_dt: pd.Series):
     if series_dt.empty:
         return pd.NaT, pd.NaT, 0
     return series_dt.min(), series_dt.max(), int(series_dt.size)
+
+
+def _eff(n, m):
+    return round((n / m * 60.0), 2) if m and m > 0 else 0.0
+
 
 def compute_am_pm_for_group(g: pd.DataFrame) -> pd.Series:
     times = g["__dt__"]
@@ -172,10 +217,10 @@ def compute_am_pm_for_group(g: pd.DataFrame) -> pd.Series:
     t_am = times[times.dt.time.between(AM_START, AM_END)]
     am_first, am_last, am_cnt = _span_metrics(t_am)
     am_mins = int(round(((am_last - am_first).total_seconds() / 60.0))) if am_cnt > 0 else 0
-    am_eff = round((am_cnt / am_mins * 60.0), 2) if am_mins > 0 else 0.0
+    am_eff = _eff(am_cnt, am_mins)
     am_idle_min, am_idle_ranges = _compute_idle(t_am)
 
-    # 下午：13:30–23:59:59（依規則扣休計算工時）
+    # 下午：13:30–23:59:59（扣休）
     t_pm = times[times.dt.time.between(PM_START, PM_END)]
     pm_first, pm_last, pm_cnt = _span_metrics(t_pm)
     if pm_cnt > 0:
@@ -184,10 +229,10 @@ def compute_am_pm_for_group(g: pd.DataFrame) -> pd.Series:
         pm_mins = max(int(round(raw_pm_mins - pm_break)), 0)
     else:
         pm_break, pm_rule, pm_mins = 0, "無時間資料", 0
-    pm_eff = round((pm_cnt / pm_mins * 60.0), 2) if pm_mins > 0 else 0.0
+    pm_eff = _eff(pm_cnt, pm_mins)
     pm_idle_min, pm_idle_ranges = _compute_idle(t_pm)
 
-    # 整體（依規則扣休）
+    # 整體（扣休）
     whole_first, whole_last, day_cnt = _span_metrics(times)
     if day_cnt > 0:
         whole_break, br_tag_whole = break_minutes_for_span(whole_first, whole_last)
@@ -195,7 +240,7 @@ def compute_am_pm_for_group(g: pd.DataFrame) -> pd.Series:
         whole_mins = max(int(round(raw_whole_mins - whole_break)), 0)
     else:
         whole_break, br_tag_whole, whole_mins = 0, "無時間資料", 0
-    whole_eff = round((day_cnt / whole_mins * 60.0), 2) if whole_mins > 0 else 0.0
+    whole_eff = _eff(day_cnt, whole_mins)
 
     return pd.Series({
         "第一筆時間": whole_first, "最後一筆時間": whole_last, "當日筆數": int(day_cnt),
@@ -212,31 +257,22 @@ def compute_am_pm_for_group(g: pd.DataFrame) -> pd.Series:
         "下午_空窗分鐘_扣休": int(pm_idle_min), "下午_空窗時段": pm_idle_ranges,
     })
 
-def _eff(n, m):
-    return round((n / m * 60.0), 2) if m and m > 0 else 0.0
-
 
 # =========================
-# 讀檔（Streamlit in-memory）
+# Excel 匯出（bytes）
 # =========================
-def read_excel_any_quiet_bytes(name: str, content: bytes) -> Dict[str, pd.DataFrame]:
-    ext = (name.split(".")[-1] or "").lower()
-    if ext in ("xlsx", "xlsm"):
-        xl = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
-        return {sn: pd.read_excel(xl, sheet_name=sn) for sn in xl.sheet_names}
-    if ext == "csv":
-        for enc in ("utf-8-sig", "cp950", "big5"):
-            try:
-                return {"CSV": pd.read_csv(io.BytesIO(content), encoding=enc)}
-            except Exception:
-                continue
-        raise Exception("CSV 讀取失敗（請確認編碼）。")
-    raise Exception("目前 Streamlit 僅支援 .xlsx/.xlsm/.csv（請另存為 xlsx 後再上傳）。")
+def autosize_columns(ws, df: pd.DataFrame):
+    from openpyxl.utils import get_column_letter
+    cols = list(df.columns) if df is not None else []
+    for i, col in enumerate(cols, start=1):
+        if df is not None and not df.empty:
+            sample = [len(str(x)) for x in df[col].head(800).tolist()]
+            max_len = max([len(str(col))] + sample)
+        else:
+            max_len = max(len(str(col)), 8)
+        ws.column_dimensions[get_column_letter(i)].width = min(max_len + 2, 60)
 
 
-# =========================
-# 匯出 Excel（bytes）
-# =========================
 def shade_rows_by_efficiency(ws, header_name="效率_件每小時", green="C6EFCE", red="FFC7CE"):
     from openpyxl.styles import PatternFill
     eff_col = None
@@ -260,101 +296,6 @@ def shade_rows_by_efficiency(ws, header_name="效率_件每小時", green="C6EFC
         for c in range(1, ws.max_column + 1):
             ws.cell(row=r, column=c).fill = fill
 
-def autosize_columns(ws, df: pd.DataFrame):
-    from openpyxl.utils import get_column_letter
-    cols = list(df.columns) if df is not None else []
-    for i, col in enumerate(cols, start=1):
-        if df is not None and not df.empty:
-            sample = [len(str(x)) for x in df[col].head(1000).tolist()]
-            max_len = max([len(str(col))] + sample)
-        else:
-            max_len = max(len(str(col)), 8)
-        ws.column_dimensions[get_column_letter(i)].width = min(max_len + 2, 60)
-
-def write_block_report(writer, detail_long: pd.DataFrame, user_col: str):
-    import openpyxl
-    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    from openpyxl.utils import get_column_letter
-
-    sheet_name = "報表_區塊"
-    wb = writer.book
-    if sheet_name in wb.sheetnames:
-        del wb[sheet_name]
-    ws = wb.create_sheet(sheet_name)
-
-    header = ["代碼", "姓名", "筆數", "工作區間", "總分鐘", "效率(件/時)", "休息分鐘", "空窗分鐘", "空窗時段"]
-    title_font = Font(bold=True, size=14)
-    sec_font = Font(bold=True, size=12)
-    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-    border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
-    center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center")
-
-    df = detail_long.copy()
-    df["工作區間"] = df.apply(
-        lambda r: (("" if pd.isna(r["第一筆時間"]) else str(r["第一筆時間"].time())) + " ~ " +
-                   ("" if pd.isna(r["最後一筆時間"]) else str(r["最後一筆時間"].time()))),
-        axis=1
-    )
-    df["總分鐘"] = df["工時_分鐘"].astype(int)
-
-    for dt_date, g in df.groupby("日期"):
-        row = ws.max_row + 1
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(header))
-        cell = ws.cell(row=row, column=1, value=f"{dt_date} 上架績效")
-        cell.font = title_font
-        cell.alignment = center
-
-        for seg in ["上午", "下午"]:
-            seg_df = g[g["時段"] == seg]
-            if seg_df.empty:
-                continue
-
-            row = ws.max_row + 1
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(header))
-            cell = ws.cell(row=row, column=1, value=seg)
-            cell.font = sec_font
-            cell.alignment = left
-
-            row = ws.max_row + 1
-            for c, h in enumerate(header, start=1):
-                cell = ws.cell(row=row, column=c, value=h)
-                cell.fill = header_fill
-                cell.alignment = center
-                cell.border = border
-                cell.font = Font(bold=True)
-
-            seg_df = seg_df.sort_values(["效率_件每小時", "筆數"], ascending=[False, False])
-            for _, r in seg_df.iterrows():
-                row = ws.max_row + 1
-                values = [
-                    r[user_col],
-                    r["對應姓名"],
-                    int(r["筆數"]),
-                    r["工作區間"],
-                    int(r["總分鐘"]),
-                    float(r["效率_件每小時"]),
-                    int(r["休息分鐘"]),
-                    int(r["空窗分鐘"]),
-                    r["空窗時段"],
-                ]
-                for c, v in enumerate(values, start=1):
-                    cell = ws.cell(row=row, column=c, value=v)
-                    cell.alignment = center if c not in (4, 9) else left
-                    cell.border = border
-
-                eff = float(r["效率_件每小時"]) if pd.notna(r["效率_件每小時"]) else 0.0
-                color = "C6EFCE" if eff >= TARGET_EFF else "FFC7CE"
-                fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
-                for c in range(1, len(header) + 1):
-                    ws.cell(row=row, column=c).fill = fill
-
-    for c in range(1, len(header) + 1):
-        max_len = max(
-            len(str(header[c - 1])),
-            max((len(str(ws.cell(row=r, column=c).value)) for r in range(1, ws.max_row + 1)), default=0),
-        )
-        ws.column_dimensions[get_column_letter(c)].width = min(max_len + 2, 60)
 
 def build_excel_bytes(user_col: str, summary_out: pd.DataFrame, daily: pd.DataFrame, detail_long: pd.DataFrame) -> bytes:
     out = io.BytesIO()
@@ -371,7 +312,7 @@ def build_excel_bytes(user_col: str, summary_out: pd.DataFrame, daily: pd.DataFr
         autosize_columns(ws_sum, summary_out[sum_cols])
         shade_rows_by_efficiency(ws_sum, "效率_件每小時")
 
-        # 明細（不輸出命中規則）
+        # 明細（每日）
         det_cols = [
             user_col, "對應姓名", "日期",
             "第一筆時間", "最後一筆時間", "當日筆數",
@@ -387,7 +328,7 @@ def build_excel_bytes(user_col: str, summary_out: pd.DataFrame, daily: pd.DataFr
         autosize_columns(ws_det, daily[det_cols])
         shade_rows_by_efficiency(ws_det, "效率_件每小時")
 
-        # 明細_時段（長表；保留命中規則）
+        # 明細_時段（長表）
         if detail_long is not None and not detail_long.empty:
             long_cols = [
                 user_col, "對應姓名", "日期", "時段",
@@ -400,9 +341,6 @@ def build_excel_bytes(user_col: str, summary_out: pd.DataFrame, daily: pd.DataFr
             ws_long = writer.sheets["明細_時段"]
             autosize_columns(ws_long, detail_long[long_cols])
             shade_rows_by_efficiency(ws_long, "效率_件每小時")
-
-            # 報表_區塊（無命中規則欄）
-            write_block_report(writer, detail_long, user_col)
 
         # 休息規則
         rules_rows = []
@@ -427,18 +365,18 @@ def build_excel_bytes(user_col: str, summary_out: pd.DataFrame, daily: pd.DataFr
 def main():
     inject_logistics_theme()
     set_page("上架產能分析（Putaway KPI）", icon="📦")
-    st.caption("總上組（上架）｜依原始 QC 紀錄計算｜AM/PM 班別（上午/下午）｜空窗排除固定帶｜下午扣休")
+    st.caption("總上組（上架）｜依原始 QC 紀錄計算｜AM/PM 班別（上午/下午）｜支援 .xls")
 
     with st.sidebar:
         st.header("⚙️ 計算條件設定")
         operator = st.text_input("分析執行人（Operator）")
         top_n = st.number_input("效率排行顯示人數（Top N）", 10, 100, 30, step=5)
-        st.info("規則來源：v8.9 上架達標分上下午區段（已移植）。")
+        st.info("提醒：上傳 .xls 需 requirements.txt 安裝 xlrd==2.0.1")
 
     card_open("📤 上傳作業原始資料（上架）")
     uploaded = st.file_uploader(
         "上傳 Excel / CSV（包含『由/到』『修訂日期/時間』『記錄輸入人』）",
-        type=["xlsx", "xlsm", "csv"],
+        type=["xlsx", "xlsm", "xls", "csv"],
         label_visibility="collapsed",
     )
     run = st.button("🚀 產出 KPI", type="primary", disabled=uploaded is None)
@@ -448,7 +386,6 @@ def main():
         st.info("請先上傳上架作業原始資料")
         return
 
-    # 讀檔 + 過濾 + 計算
     with st.spinner("計算中，請稍候..."):
         content = uploaded.getvalue()
         sheets = read_excel_any_quiet_bytes(uploaded.name, content)
@@ -462,6 +399,7 @@ def main():
         if not kept_all:
             st.error("無符合資料（可能缺『由/到』欄或過濾後為空）。")
             return
+
         data = pd.concat(kept_all, ignore_index=True)
 
         user_col = find_first_column(data, INPUT_USER_CANDIDATES)
@@ -470,7 +408,7 @@ def main():
             st.error("找不到『記錄輸入人』欄位（候選：記錄輸入人/記錄輸入者/建立人/輸入人）。")
             return
         if revdt_col is None:
-            st.error("找不到『修訂日期/時間』欄位（候選：修訂日期/修訂時間/修訂日/異動時間/修改時間）。")
+            st.error("找不到『修訂日期/時間』欄位（候選：修訂日期/修訂時間/異動時間/修改時間…）。")
             return
 
         data["__dt__"] = pd.to_datetime(data[revdt_col], errors="coerce")
@@ -510,12 +448,10 @@ def main():
         for c in ["總筆數", "總工時_分鐘_扣休", "上午筆數", "上午工時_分鐘", "下午筆數", "下午工時_分鐘_扣休"]:
             summary[c] = summary[c].fillna(0).astype(int)
 
-        summary = summary.sort_values(["總筆數", "總工時_分鐘_扣休"], ascending=[False, False])
-
-        # 整體合計列
+        # 合計列（彙總）
         total_people = int(summary[user_col].nunique())
-        met_people = int((summary["效率_件每小時"] >= TARGET_EFF).sum())
-        rate = (met_people / total_people) if total_people > 0 else 0.0
+        total_met = int((summary["效率_件每小時"] >= TARGET_EFF).sum())
+        total_rate = (total_met / total_people) if total_people > 0 else 0.0
 
         total_row = {
             user_col: "整體合計", "對應姓名": "",
@@ -532,7 +468,7 @@ def main():
         }
         summary_out = pd.concat([summary, pd.DataFrame([total_row])], ignore_index=True)
 
-        # 明細_時段（長表）
+        # 長表：明細_時段
         long_rows = []
         for _, r in daily.iterrows():
             if r["上午_筆數"] > 0:
@@ -563,24 +499,20 @@ def main():
         if not detail_long.empty:
             detail_long = detail_long.sort_values([user_col, "日期", "時段", "第一筆時間"])
 
-        # 產出 Excel bytes
+        # 匯出 bytes
         xlsx_bytes = build_excel_bytes(user_col, summary_out, daily, detail_long)
 
     # ======================
-    # UI：AM/PM 左右分區（用你要的專業術語）
+    # 介面：左右 AM/PM
     # ======================
-    # 以「彙總」的上午/下午效率作圖
     plot_df = summary.copy()
-    plot_df = plot_df[plot_df[user_col] != "整體合計"] if (plot_df[user_col] == "整體合計").any() else plot_df
 
     col_l, col_r = st.columns(2)
 
     with col_l:
         card_open("🌓 AM 班（上午）KPI")
         render_kpis([
-            KPI("總人數", f"{total_people:,}"),
-            KPI("達標人數", f"{met_people:,}"),
-            KPI("達標率", f"{rate:.1%}"),
+            KPI("人數", f"{int(plot_df[user_col].nunique()):,}"),
             KPI("達標門檻", f"效率 ≥ {TARGET_EFF}"),
         ])
         card_close()
@@ -600,12 +532,11 @@ def main():
 
     with col_r:
         card_open("🌙 PM 班（下午）KPI")
-        # 下午達標率用「下午效率」
         pm_met = int((plot_df["下午效率_件每小時"] >= TARGET_EFF).sum())
         pm_total = int(plot_df[user_col].nunique())
         pm_rate = (pm_met / pm_total) if pm_total > 0 else 0.0
         render_kpis([
-            KPI("總人數", f"{pm_total:,}"),
+            KPI("人數", f"{pm_total:,}"),
             KPI("達標人數", f"{pm_met:,}"),
             KPI("達標率", f"{pm_rate:.1%}"),
             KPI("達標門檻", f"效率 ≥ {TARGET_EFF}"),
@@ -627,7 +558,7 @@ def main():
 
     # 匯出
     card_open("⬇️ 匯出 KPI 報表（Excel）")
-    default_name = f"{uploaded.name.rsplit('.',1)[0]}上架績效.xlsx"
+    default_name = f"{uploaded.name.rsplit('.', 1)[0]}_上架績效.xlsx"
     download_excel(xlsx_bytes, default_name)
     card_close()
 
@@ -650,9 +581,11 @@ def main():
                 "filter": "由=QC 且 到不含關鍵字",
                 "am_range": "07:00-12:30",
                 "pm_range": "13:30-23:59:59",
+                "idle_min_threshold": IDLE_MIN_THRESHOLD,
+                "idle_exclude_ranges": [(a.strftime("%H:%M"), b.strftime("%H:%M")) for a, b in EXCLUDE_IDLE_RANGES],
             },
-            "kpi_am": {"people": total_people, "pass_rate": rate},
-            "kpi_pm": {"people": pm_total, "pass_rate": pm_rate},
+            "kpi_am": {"people": total_people, "pass_rate": total_rate},
+            "kpi_pm": {"people": int(plot_df[user_col].nunique()), "pass_rate": float(pm_rate)},
             "export_object_path": export_path,
         }
         row = insert_audit_run(payload)
