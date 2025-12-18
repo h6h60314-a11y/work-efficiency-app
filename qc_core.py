@@ -694,6 +694,32 @@ def run_qc_efficiency(file_bytes: bytes, original_name: str, skip_rules: list[di
         else:
             idle_details = pd.DataFrame(columns=["來源分頁","日期","記錄輸入人","姓名","起","迄","空窗分鐘","空窗區間"])
 
+        # ===== 一致過濾：只保留「同時有 記錄輸入人 + 姓名」的資料（KPI/圖表/匯出 Excel 全部一致）=====
+
+        def _nonempty_series(s: pd.Series) -> pd.Series:
+
+            return s.fillna("").astype(str).str.strip().ne("")
+
+
+        def _filter_user_and_name(df: pd.DataFrame) -> pd.DataFrame:
+
+            if df is None or df.empty:
+
+                return df
+
+            if "記錄輸入人" in df.columns and "姓名" in df.columns:
+
+                return df[_nonempty_series(df["記錄輸入人"]) & _nonempty_series(df["姓名"])].copy()
+
+            return df
+
+
+        full_df = _filter_user_and_name(full_df)
+
+        ampm_df = _filter_user_and_name(ampm_df)
+
+        idle_details = _filter_user_and_name(idle_details)
+
         total_idle = int(idle_details["空窗分鐘"].notna().sum()) if not idle_details.empty else 0
         total_df = pd.DataFrame({"項目":[f"全體空窗筆數(>{THRESHOLD_MIN}分)"], "數量":[total_idle]})
 
