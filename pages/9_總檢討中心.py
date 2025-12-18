@@ -1,15 +1,21 @@
 import streamlit as st
 import pandas as pd
+import datetime as dt
 from supabase import create_client
 from postgrest.exceptions import APIError
 
 from common_ui import inject_logistics_theme, set_page, card_open, card_close
 
 
+# ========= Supabase =========
 def sb():
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SERVICE_ROLE_KEY"])
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_SERVICE_ROLE_KEY"],
+    )
 
 
+# ========= Utilities =========
 def _human_api_error(e: Exception) -> str:
     try:
         if hasattr(e, "args") and e.args:
@@ -19,27 +25,28 @@ def _human_api_error(e: Exception) -> str:
     return str(e)
 
 
-def self_check():
-    card_open("🧪 資料庫連線狀態（Supabase）")
-    st.write(
-        "SUPABASE_URL：",
-        (st.secrets.get("SUPABASE_URL", "")[:40] + "...") if st.secrets.get("SUPABASE_URL") else "（未設定）",
-    )
-    st.write("SUPABASE_BUCKET：", st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports"))
-    st.write(
-        "KEY 前綴：",
-        (st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")[:12] + "...")
-        if st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-        else "（未設定）",
-    )
-    try:
-        _ = sb().schema("public").table("audit_runs").select("id,created_at").limit(1).execute()
-        st.success("✅ audit_runs 可讀取（連線/權限/表名 OK）")
-    except APIError as e:
-        st.error("❌ 讀取 audit_runs 失敗")
-        st.code(_human_api_error(e))
-        st.stop()
-    card_close()
+def current_delete_password():
+    """
+    依月份取得刪除密碼
+    Key 格式：DELETE_PASSWORD_YYYYMM
+    """
+    ym = dt.datetime.now().strftime("%Y%m")
+    key = f"DELETE_PASSWORD_{ym}"
+    return key, st.secrets.get(key)
+
+
+def download_from_storage(object_path: str) -> bytes:
+    bucket = st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports")
+    return sb().storage.from_(bucket).download(object_path)
+
+
+def remove_from_storage(object_path: str):
+    bucket = st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports")
+    sb().storage.from_(bucket).remove([object_path])
+
+
+def delete_audit_run(run_id: str):
+    sb().schema("public").table("audit_runs").delete().eq("id", run_id).execute()
 
 
 def _rate_light(x):
@@ -56,31 +63,23 @@ def _rate_light(x):
     return (f"{x:.0%}", "🔴")
 
 
-def download_from_storage(object_path: str) -> bytes:
-    client = sb()
-    bucket = st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports")
-    return client.storage.from_(bucket).download(object_path)
-
-
-def remove_from_storage(object_path: str):
-    client = sb()
-    bucket = st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports")
-    client.storage.from_(bucket).remove([object_path])
-
-
-def delete_audit_run(run_id: str):
-    client = sb()
-    client.schema("public").table("audit_runs").delete().eq("id", run_id).execute()
-
-
+# ========= Page =========
 def main():
     inject_logistics_theme()
     set_page("營運稽核與復盤中心", icon="📊")
-    st.caption("歷次分析留存｜AM/PM 班 KPI｜達標燈號｜下載/刪除留存報表（需密碼）")
+    st.caption("歷次分析留存｜AM/PM KPI｜下載 / 刪除（每月輪替密碼）")
 
-    self_check()
+    # 取得當月密碼
+    pwd_key, expected_pwd = current_delete_password()
 
-    # 讀取
+    if not expected_pwd:
+        st.error(
+            f"❌ 尚未設定本月刪除密碼：{pwd_key}\n"
+            "請至 Streamlit Secrets 設定後再使用刪除功能。"
+        )
+        st.stop()
+
+    # 讀取資料
     rows = (
         sb()
         .schema("public")
@@ -94,49 +93,14 @@ def main():
     )
 
     if not rows:
-        st.info("目前 audit_runs 沒有任何留存紀錄。")
+        st.info("目前尚無任何留存紀錄")
         return
 
     df = pd.DataFrame(rows)
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
-    # Sidebar filters
-    with st.sidebar:
-        st.header("🔎 查詢條件（管理用）")
-        min_d = df["created_at"].dt.date.min()
-        max_d = df["created_at"].dt.date.max()
-        date_range = st.date_input("分析日期區間", value=(min_d, max_d))
-
-        ops = sorted([x for x in df.get("operator", pd.Series([])).dropna().unique()])
-        operator = st.selectbox("分析執行人（Operator）", ["全部"] + ops)
-
-        apps = sorted([x for x in df.get("app_name", pd.Series([])).dropna().unique()])
-        app_name = st.selectbox("模組別", ["全部"] + apps)
-
-    mask = (df["created_at"].dt.date >= date_range[0]) & (df["created_at"].dt.date <= date_range[1])
-    if operator != "全部":
-        mask &= df["operator"] == operator
-    if app_name != "全部":
-        mask &= df["app_name"] == app_name
-
-    df_f = df[mask].copy()
-    if df_f.empty:
-        st.warning("篩選後沒有資料。")
-        return
-
-    # KPI trend
-    card_open("📈 KPI 趨勢（AM 班 vs PM 班）")
-    trend = []
-    for _, r in df_f.iterrows():
-        for k, label in [("kpi_am", "AM 班"), ("kpi_pm", "PM 班")]:
-            obj = r.get(k) or {}
-            trend.append({"分析時間": r["created_at"], "班別": label, "平均效率": obj.get("avg_eff")})
-    tdf = pd.DataFrame(trend).dropna(subset=["分析時間"])
-    st.line_chart(tdf, x="分析時間", y="平均效率", color="班別")
-    card_close()
-
-    # Runs table with lights
-    card_open("📄 歷次分析留存紀錄（含達標燈號）")
+    # ===== 表格 =====
+    card_open("📄 歷次分析留存紀錄")
 
     def _light_for(row, key):
         obj = row.get(key) or {}
@@ -144,23 +108,27 @@ def main():
         pct, lamp = _rate_light(rate)
         return f"{lamp} {pct}"
 
-    df_f["AM達標"] = df_f.apply(lambda r: _light_for(r, "kpi_am"), axis=1)
-    df_f["PM達標"] = df_f.apply(lambda r: _light_for(r, "kpi_pm"), axis=1)
-
-    show_cols = ["created_at", "app_name", "operator", "source_filename", "AM達標", "PM達標", "id", "export_object_path"]
-    for c in show_cols:
-        if c not in df_f.columns:
-            df_f[c] = None
+    df["AM達標"] = df.apply(lambda r: _light_for(r, "kpi_am"), axis=1)
+    df["PM達標"] = df.apply(lambda r: _light_for(r, "kpi_pm"), axis=1)
 
     st.dataframe(
-        df_f[show_cols].rename(
+        df[
+            [
+                "created_at",
+                "app_name",
+                "operator",
+                "source_filename",
+                "AM達標",
+                "PM達標",
+                "id",
+            ]
+        ].rename(
             columns={
                 "created_at": "分析時間",
                 "app_name": "模組別",
                 "operator": "分析執行人",
                 "source_filename": "來源檔案",
                 "id": "紀錄ID",
-                "export_object_path": "報表留存路徑",
             }
         ),
         use_container_width=True,
@@ -168,77 +136,53 @@ def main():
     )
     card_close()
 
-    # 操作區：下載 + 刪除（密碼）
-    card_open("🧰 歷史紀錄操作（下載 / 刪除）")
+    # ===== 操作 =====
+    card_open("🧰 紀錄操作（下載 / 刪除）")
 
-    idxs = df_f.index.tolist()
-    selected = st.selectbox(
+    idx = st.selectbox(
         "選擇一筆紀錄",
-        options=idxs,
-        format_func=lambda i: f"{df_f.loc[i,'created_at']}｜{df_f.loc[i,'app_name']}｜{df_f.loc[i,'source_filename']}",
+        options=df.index.tolist(),
+        format_func=lambda i: f"{df.loc[i,'created_at']}｜{df.loc[i,'app_name']}｜{df.loc[i,'source_filename']}",
     )
 
-    run_id = str(df_f.loc[selected].get("id"))
-    obj_path = df_f.loc[selected].get("export_object_path")
+    run_id = df.loc[idx, "id"]
+    obj_path = df.loc[idx, "export_object_path"]
 
-    st.markdown(f"- **紀錄ID**：`{run_id}`")
-    st.markdown(f"- **留存報表**：`{obj_path}`" if obj_path else "- **留存報表**：無")
+    st.markdown(f"- **紀錄 ID**：`{run_id}`")
+    st.markdown(f"- **本月刪除密碼 Key**：`{pwd_key}`")
 
-    c1, c2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
     # 下載
-    with c1:
-        if obj_path:
-            if st.button("⬇️ 準備下載 Excel", use_container_width=True):
-                try:
-                    content = download_from_storage(obj_path)
-                    st.download_button(
-                        "點此下載 Excel（留存）",
-                        data=content,
-                        file_name=str(obj_path).split("/")[-1],
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.error("下載失敗")
-                    st.code(repr(e))
-        else:
-            st.info("此筆沒有留存 Excel")
+    with col1:
+        if obj_path and st.button("⬇️ 下載留存 Excel", use_container_width=True):
+            content = download_from_storage(obj_path)
+            st.download_button(
+                "點此下載",
+                data=content,
+                file_name=obj_path.split("/")[-1],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
-    # 刪除（密碼鎖）
-    with c2:
-        st.warning("刪除為不可逆操作：會刪除 DB 紀錄，並可選擇同步刪除 Storage 報表。")
+    # 刪除（每月輪替密碼）
+    with col2:
+        st.warning("⚠️ 刪除為不可逆操作（DB + Storage）")
+        confirm = st.checkbox("我已確認要刪除此筆紀錄")
+        keyword = st.text_input("輸入 DELETE 以解鎖", value="")
+        pwd = st.text_input("輸入本月刪除密碼", type="password")
 
-        # Secrets password
-        expected = st.secrets.get("DELETE_PASSWORD", "")
-        if not expected:
-            st.error("未設定 DELETE_PASSWORD（請到 Streamlit Secrets 新增）")
-            st.stop()
+        unlocked = confirm and keyword.strip().upper() == "DELETE" and pwd == expected_pwd
 
-        del_storage = st.checkbox("同步刪除留存報表（Storage）", value=True, disabled=not bool(obj_path))
-        confirmed = st.checkbox("我已確認要刪除這筆紀錄", value=False)
-        token = st.text_input("輸入 DELETE 以解鎖刪除", value="")
-        pwd = st.text_input("刪除密碼（DELETE_PASSWORD）", value="", type="password")
-
-        unlocked = (confirmed and token.strip().upper() == "DELETE" and pwd == expected)
-
-        if st.button("🗑️ 刪除選定紀錄", type="primary", use_container_width=True, disabled=not unlocked):
+        if st.button("🗑️ 刪除紀錄", disabled=not unlocked, type="primary", use_container_width=True):
             try:
-                # Storage（可選）
-                if del_storage and obj_path:
-                    try:
-                        remove_from_storage(obj_path)
-                    except Exception as e:
-                        st.warning("Storage 報表刪除失敗，但會繼續刪除 DB 紀錄。")
-                        st.code(repr(e))
-
-                # DB
+                if obj_path:
+                    remove_from_storage(obj_path)
                 delete_audit_run(run_id)
-
-                st.success("✅ 已刪除完成（DB 紀錄已移除；若勾選 Storage 也已嘗試刪除）")
-                st.info("請重新整理或等待頁面自動重跑以更新列表。")
+                st.success("✅ 刪除完成（已套用當月密碼）")
+                st.info("請重新整理頁面以更新清單")
             except APIError as e:
-                st.error("❌ 刪除 DB 紀錄失敗（APIError）")
+                st.error("❌ 刪除失敗（APIError）")
                 st.code(_human_api_error(e))
             except Exception as e:
                 st.error("❌ 刪除失敗")
