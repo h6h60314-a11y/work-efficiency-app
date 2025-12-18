@@ -3,16 +3,11 @@ import pandas as pd
 from supabase import create_client
 from postgrest.exceptions import APIError
 
-from common_ui import set_page, card_open, card_close
+from common_ui import inject_logistics_theme, set_page, card_open, card_close
 
 
 def sb():
-    url = st.secrets.get("SUPABASE_URL", "")
-    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
-    if not url or not key:
-        st.error("缺少 Secrets：SUPABASE_URL 或 SUPABASE_SERVICE_ROLE_KEY")
-        st.stop()
-    return create_client(url, key)
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SERVICE_ROLE_KEY"])
 
 
 def _human_api_error(e: Exception) -> str:
@@ -24,18 +19,35 @@ def _human_api_error(e: Exception) -> str:
     return str(e)
 
 
-def load_audit_runs_no_cache(limit: int = 1000):
-    client = sb()
-    return (
-        client.schema("public")
-        .table("audit_runs")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-        .data
-        or []
-    )
+def self_check():
+    card_open("🧪 資料庫連線狀態（Supabase）")
+    st.write("SUPABASE_URL：", (st.secrets.get("SUPABASE_URL", "")[:40] + "...") if st.secrets.get("SUPABASE_URL") else "（未設定）")
+    st.write("SUPABASE_BUCKET：", st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports"))
+    st.write("KEY 前綴：", (st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")[:12] + "...") if st.secrets.get("SUPABASE_SERVICE_ROLE_KEY") else "（未設定）")
+    try:
+        _ = sb().schema("public").table("audit_runs").select("id,created_at").limit(1).execute()
+        st.success("✅ audit_runs 可讀取（連線/權限/表名 OK）")
+    except APIError as e:
+        st.error("❌ 讀取 audit_runs 失敗")
+        st.code(_human_api_error(e))
+        st.stop()
+    card_close()
+
+
+def _rate_light(x: float | None):
+    # 你可調整門檻：>=85% 綠、70-85 黃、<70 紅
+    if x is None:
+        return ("—", "⚪")
+    try:
+        x = float(x)
+    except Exception:
+        return ("—", "⚪")
+
+    if x >= 0.85:
+        return (f"{x:.0%}", "🟢")
+    if x >= 0.70:
+        return (f"{x:.0%}", "🟡")
+    return (f"{x:.0%}", "🔴")
 
 
 def download_from_storage(object_path: str) -> bytes:
@@ -44,74 +56,44 @@ def download_from_storage(object_path: str) -> bytes:
     return client.storage.from_(bucket).download(object_path)
 
 
-def self_check():
-    card_open("🧪 Supabase 連線自檢")
-    st.write(
-        "SUPABASE_URL：",
-        st.secrets.get("SUPABASE_URL", "")[:40] + "..."
-        if st.secrets.get("SUPABASE_URL")
-        else "（未設定）",
-    )
-    st.write("SUPABASE_BUCKET：", st.secrets.get("SUPABASE_BUCKET", "work-efficiency-exports"))
-    st.write(
-        "KEY 前綴：",
-        (st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")[:12] + "...")
-        if st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-        else "（未設定）",
-    )
-
-    try:
-        client = sb()
-        _ = (
-            client.schema("public")
-            .table("audit_runs")
-            .select("id,created_at")
-            .limit(1)
-            .execute()
-        )
-        st.success("✅ audit_runs 可讀取（連線/權限/表名 OK）")
-    except APIError as e:
-        st.error("❌ 讀取 audit_runs 失敗（通常是：表不存在 / 權限 / RLS / key 錯）")
-        st.code(_human_api_error(e))
-        st.stop()
-    except Exception as e:
-        st.error("❌ 連線失敗（通常是 URL/key 不對）")
-        st.code(str(e))
-        st.stop()
-
-    card_close()
-
-
 def main():
-    set_page("總檢討中心", icon="📊")
+    inject_logistics_theme()
+    set_page("營運稽核與復盤中心", icon="📊")
+    st.caption("歷次分析留存｜AM/PM 班 KPI｜達標燈號｜下載留存報表")
+
     self_check()
 
-    try:
-        rows = load_audit_runs_no_cache(limit=1000)
-    except APIError as e:
-        st.error("讀取 audit_runs 時發生 APIError：")
-        st.code(_human_api_error(e))
-        st.stop()
+    rows = (
+        sb()
+        .schema("public")
+        .table("audit_runs")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(2000)
+        .execute()
+        .data
+        or []
+    )
 
     if not rows:
-        st.info("目前 audit_runs 沒有任何紀錄。請先去『驗收達標效率』跑一次，確認有寫入。")
+        st.info("目前 audit_runs 沒有任何留存紀錄。請先跑一次模組並確認「稽核留存狀態」成功。")
         return
 
     df = pd.DataFrame(rows)
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
-    # ========== Filters ==========
+    # Sidebar filters
     with st.sidebar:
-        st.header("🔍 篩選條件")
+        st.header("🔎 查詢條件（管理用）")
         min_d = df["created_at"].dt.date.min()
         max_d = df["created_at"].dt.date.max()
-        date_range = st.date_input("執行日期區間", value=(min_d, max_d))
+        date_range = st.date_input("分析日期區間", value=(min_d, max_d))
 
         ops = sorted([x for x in df.get("operator", pd.Series([])).dropna().unique()])
-        operator = st.selectbox("執行人", options=["全部"] + ops)
+        operator = st.selectbox("分析執行人（Operator）", ["全部"] + ops)
 
         apps = sorted([x for x in df.get("app_name", pd.Series([])).dropna().unique()])
-        app_name = st.selectbox("功能", options=["全部"] + apps)
+        app_name = st.selectbox("模組別", ["全部"] + apps)
 
     mask = (df["created_at"].dt.date >= date_range[0]) & (df["created_at"].dt.date <= date_range[1])
     if operator != "全部":
@@ -124,30 +106,37 @@ def main():
         st.warning("篩選後沒有資料。")
         return
 
-    # ========== KPI Trend ==========
-    card_open("📈 KPI 歷史趨勢（上午 vs 下午）")
-    kpi_rows = []
+    # KPI trend (avg_eff)
+    card_open("📈 KPI 趨勢（AM 班 vs PM 班）")
+    trend = []
     for _, r in df_f.iterrows():
-        for seg in ["am", "pm"]:
-            k = r.get(f"kpi_{seg}") or {}
-            kpi_rows.append(
+        for k, label in [("kpi_am", "AM 班"), ("kpi_pm", "PM 班")]:
+            obj = r.get(k) or {}
+            trend.append(
                 {
-                    "時間": r["created_at"],
-                    "時段": "上午" if seg == "am" else "下午",
-                    "平均效率": k.get("avg_eff"),
-                    "達標率": k.get("pass_rate"),
-                    "總工時": k.get("total_hours"),
-                    "總筆數": k.get("total_cnt"),
-                    "人數": k.get("people"),
+                    "分析時間": r["created_at"],
+                    "班別": label,
+                    "平均效率": obj.get("avg_eff"),
+                    "達標率": obj.get("pass_rate"),
                 }
             )
-    kpi_df = pd.DataFrame(kpi_rows).sort_values("時間")
-    st.line_chart(kpi_df, x="時間", y="平均效率", color="時段")
+    tdf = pd.DataFrame(trend).dropna(subset=["分析時間"])
+    st.line_chart(tdf, x="分析時間", y="平均效率", color="班別")
     card_close()
 
-    # ========== Runs Table ==========
-    card_open("📄 執行紀錄")
-    show_cols = ["created_at", "operator", "source_filename", "app_name", "id", "export_object_path"]
+    # Runs table with lights
+    card_open("📄 歷次分析留存紀錄（含達標燈號）")
+
+    def _light_for(row, key):
+        obj = row.get(key) or {}
+        rate = obj.get("pass_rate")
+        pct, lamp = _rate_light(rate)
+        return f"{lamp} {pct}"
+
+    df_f["AM達標"] = df_f.apply(lambda r: _light_for(r, "kpi_am"), axis=1)
+    df_f["PM達標"] = df_f.apply(lambda r: _light_for(r, "kpi_pm"), axis=1)
+
+    show_cols = ["created_at", "app_name", "operator", "source_filename", "AM達標", "PM達標", "id", "export_object_path"]
     for c in show_cols:
         if c not in df_f.columns:
             df_f[c] = None
@@ -155,12 +144,12 @@ def main():
     st.dataframe(
         df_f[show_cols].rename(
             columns={
-                "created_at": "執行時間",
-                "operator": "執行人",
+                "created_at": "分析時間",
+                "app_name": "模組別",
+                "operator": "分析執行人",
                 "source_filename": "來源檔案",
-                "app_name": "功能",
                 "id": "紀錄ID",
-                "export_object_path": "報表路徑",
+                "export_object_path": "報表留存路徑",
             }
         ),
         use_container_width=True,
@@ -168,13 +157,13 @@ def main():
     )
     card_close()
 
-    # ========== Download ==========
-    card_open("⬇️ 下載歷史報表（當次匯出 Excel）")
+    # Download selected
+    card_open("⬇️ 下載當次 KPI 報表（留存）")
     idxs = df_f.index.tolist()
     selected = st.selectbox(
-        "選擇一筆紀錄",
+        "選擇紀錄",
         options=idxs,
-        format_func=lambda i: f"{df_f.loc[i,'created_at']}｜{df_f.loc[i,'source_filename']}",
+        format_func=lambda i: f"{df_f.loc[i,'created_at']}｜{df_f.loc[i,'app_name']}｜{df_f.loc[i,'source_filename']}",
     )
 
     obj_path = df_f.loc[selected].get("export_object_path")
@@ -188,14 +177,11 @@ def main():
                     file_name=obj_path.split("/")[-1],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            except APIError as e:
-                st.error("下載 Storage 檔案失敗：")
-                st.code(_human_api_error(e))
             except Exception as e:
-                st.error("下載失敗：")
-                st.code(str(e))
+                st.error("下載失敗")
+                st.code(repr(e))
     else:
-        st.warning("此筆紀錄沒有留存 Excel（export_object_path 為空）。")
+        st.warning("此筆紀錄未留存 Excel（export_object_path 為空）。")
     card_close()
 
 
