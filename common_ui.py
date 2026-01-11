@@ -1,278 +1,295 @@
-from __future__ import annotations
-
-import io
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
-
-import pandas as pd
+# common_ui.py
+# -*- coding: utf-8 -*-
 import streamlit as st
 
-
-# =========================================================
-# Theme / CSS
-# =========================================================
-def inject_logistics_theme():
-    """
-    Logistics / Warehouse dashboard style:
-    - Industrial blue + steel gray
-    - Card layout
-    - Reduce "top white bar" feeling
-    """
-    st.markdown(
-        """
+THEME_CSS = r"""
 <style>
-/* ---------- Base ---------- */
+/* ========== Base ========== */
 :root{
-  --ink: rgba(15, 23, 42, 0.92);          /* slate-900 */
-  --muted: rgba(15, 23, 42, 0.60);
-  --line: rgba(15, 23, 42, 0.10);
-  --card: rgba(255,255,255,0.88);
-  --card2: rgba(255,255,255,0.70);
-  --blue: rgba(2, 132, 199, 1.00);        /* sky-600 */
-  --blueSoft: rgba(2, 132, 199, 0.12);
-  --blueSoft2: rgba(2, 132, 199, 0.18);
-  --ok: rgba(22, 163, 74, 1.0);
-  --warn: rgba(245, 158, 11, 1.0);
-  --bad: rgba(220, 38, 38, 1.0);
+  --bg: #f5f7fb;
+  --card: #ffffff;
+  --text: rgba(15, 23, 42, 0.92);
+  --muted: rgba(15, 23, 42, 0.62);
+
+  --nav-bg: #0b1220;
+  --nav-bg2:#0a1020;
+  --nav-text: rgba(255,255,255,.84);
+  --nav-muted: rgba(255,255,255,.55);
+  --nav-hover: rgba(255,255,255,.08);
+
+  --primary: #2563eb;     /* 藍 */
+  --primary2:#1d4ed8;
+  --border: rgba(15,23,42,.10);
+  --shadow: 0 10px 30px rgba(15,23,42,.08);
+  --radius: 18px;
+  --radius2: 22px;
 }
 
-.stApp {
-  color: var(--ink);
-  background: radial-gradient(1200px 700px at 20% 0%, rgba(2,132,199,0.10) 0%, rgba(245,248,252,1) 55%, rgba(236,242,250,1) 100%);
+/* font */
+html, body, [class*="st-"], .stApp{
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+               "Noto Sans TC", "Microsoft JhengHei", Arial, sans-serif !important;
 }
 
-/* remove top bar feeling */
-header[data-testid="stHeader"] { background: transparent !important; }
-div[data-testid="stToolbar"] { right: 0.8rem; }
-div[data-testid="stDecoration"] { display: none; }
+/* remove default streamlit chrome */
+header[data-testid="stHeader"]{ display:none; }
+#MainMenu{ visibility:hidden; }
+footer{ visibility:hidden; }
 
-/* ---------- Sidebar ---------- */
-section[data-testid="stSidebar"]{
-  background: rgba(248,250,252,1);
-  border-right: 1px solid var(--line);
-}
-section[data-testid="stSidebar"] *{
-  color: var(--ink);
+/* App background */
+.stApp{
+  background: var(--bg);
 }
 
-/* ---------- Container padding ---------- */
-.block-container{
-  padding-top: 1.2rem;
-  padding-bottom: 2.0rem;
+/* ========== Top Bar (custom) ========== */
+.df-topbar{
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 52px;
+  background: #0b0f1a;
+  color: rgba(255,255,255,.92);
+  z-index: 1000;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border-bottom: 1px solid rgba(255,255,255,.06);
 }
-
-/* ---------- Buttons ---------- */
-.stButton > button{
-  border-radius: 14px;
-  border: 1px solid rgba(2, 132, 199, 0.30);
-  background: var(--blueSoft);
-  color: var(--ink);
-  padding: 0.55rem 0.9rem;
-  font-weight: 600;
+.df-topbar .wrap{
+  width: min(1400px, calc(100% - 24px));
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
 }
-.stButton > button:hover{
-  border: 1px solid rgba(2, 132, 199, 0.45);
-  background: var(--blueSoft2);
-}
-
-/* ---------- File uploader ---------- */
-div[data-testid="stFileUploaderDropzone"]{
-  border-radius: 18px;
-  border: 1px dashed rgba(15, 23, 42, 0.22);
-  background: rgba(255,255,255,0.80);
-}
-
-/* ---------- Card blocks ---------- */
-._gt_card{
-  border: 1px solid var(--line);
-  background: var(--card);
-  border-radius: 20px;
-  padding: 16px 16px 6px 16px;
-  box-shadow: 0 10px 30px rgba(15,23,42,0.06);
-  margin-bottom: 14px;
-}
-._gt_card h3{
-  margin: 0 0 10px 0;
-  letter-spacing: .2px;
-}
-
-/* ---------- KPI metric cards ---------- */
-[data-testid="stMetric"]{
-  background: rgba(255,255,255,0.90);
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 14px 14px 10px 14px;
-}
-[data-testid="stMetricLabel"]{
-  color: var(--muted) !important;
-  font-weight: 600;
-}
-[data-testid="stMetricValue"]{
+.df-topbar .title{
   font-weight: 800;
+  letter-spacing: .6px;
+  font-size: 14px;
 }
-
-/* ---------- Tables ---------- */
-div[data-testid="stDataFrame"]{
-  border-radius: 16px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  background: var(--card2);
+.df-topbar .right{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  font-size: 13px;
+  color: rgba(255,255,255,.80);
 }
-
-/* ---------- Small helper ---------- */
-._gt_badge{
-  display: inline-block;
-  padding: 2px 10px;
+.df-pill{
+  display:inline-flex;
+  align-items:center;
+  gap: 6px;
+  padding: 6px 10px;
   border-radius: 999px;
-  border: 1px solid var(--line);
-  background: rgba(255,255,255,0.85);
-  color: var(--muted);
-  font-size: 12px;
+  background: rgba(34,197,94,.14);
+  border: 1px solid rgba(34,197,94,.25);
+  color: rgba(255,255,255,.92);
   font-weight: 700;
+  font-size: 12px;
+}
+.df-dot{
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+}
+
+/* push content below fixed topbar */
+div[data-testid="stAppViewContainer"]{
+  padding-top: 64px;
+}
+
+/* ========== Sidebar ========== */
+section[data-testid="stSidebar"]{
+  background: linear-gradient(180deg, var(--nav-bg), var(--nav-bg2));
+  border-right: 1px solid rgba(255,255,255,.06);
+}
+section[data-testid="stSidebar"] > div{
+  padding-top: 12px;
+}
+.df-brand{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  padding: 6px 10px 14px 10px;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  margin-bottom: 10px;
+}
+.df-brand .logo{
+  width: 36px; height: 36px;
+  border-radius: 12px;
+  background: rgba(37,99,235,.18);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border: 1px solid rgba(37,99,235,.30);
+}
+.df-brand .name{
+  color: rgba(255,255,255,.92);
+  font-weight: 900;
+  font-size: 16px;
+  line-height: 1.1;
+}
+.df-brand .sub{
+  color: rgba(255,255,255,.55);
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 1px;
+}
+
+/* section titles */
+.df-nav-title{
+  color: var(--nav-muted);
+  font-weight: 800;
+  font-size: 12px;
+  letter-spacing: .8px;
+  margin: 14px 10px 6px 10px;
+  text-transform: none;
+}
+
+/* Streamlit buttons in sidebar -> make them look like nav items */
+section[data-testid="stSidebar"] div[data-testid="stButton"] > button{
+  width: 100%;
+  background: transparent !important;
+  border: 1px solid transparent !important;
+  color: var(--nav-text) !important;
+  border-radius: 12px !important;
+  padding: 9px 10px !important;
+  justify-content: flex-start !important;
+  gap: 10px !important;
+  font-weight: 750 !important;
+  font-size: 14px !important;
+  line-height: 1.15 !important;
+}
+section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover{
+  background: var(--nav-hover) !important;
+}
+
+/* Selected nav item style: you set by adding df-selected class on a container */
+.df-selected div[data-testid="stButton"] > button{
+  background: rgba(37,99,235,.22) !important;
+  border: 1px solid rgba(37,99,235,.55) !important;
+  box-shadow: 0 0 0 1px rgba(37,99,235,.25) inset !important;
+}
+
+/* ========== Main page title (blue left bar) ========== */
+.df-page-title{
+  display:flex;
+  align-items:center;
+  gap: 10px;
+  margin: 6px 0 12px 0;
+}
+.df-page-title .bar{
+  width: 4px;
+  height: 24px;
+  border-radius: 99px;
+  background: var(--primary);
+}
+.df-page-title .txt{
+  font-size: 20px;
+  font-weight: 900;
+  color: var(--text);
+}
+
+/* ========== Card ========== */
+.df-card{
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius2);
+  box-shadow: var(--shadow);
+  padding: 22px 22px;
+}
+.df-card-center{
+  display:flex;
+  flex-direction: column;
+  align-items:center;
+  justify-content:center;
+  gap: 10px;
+  text-align:center;
+}
+.df-cube{
+  width: 64px; height: 64px;
+  border-radius: 18px;
+  background: rgba(37,99,235,.10);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border: 1px solid rgba(37,99,235,.18);
+}
+.df-card h2{
+  margin: 0;
+  font-size: 28px;
+  font-weight: 950;
+  color: var(--text);
+}
+.df-card p{
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+/* style file uploader dropzone */
+div[data-testid="stFileUploaderDropzone"]{
+  border: 2px dashed rgba(15,23,42,.20) !important;
+  border-radius: 18px !important;
+  padding: 24px !important;
+  background: rgba(15,23,42,.02) !important;
+}
+div[data-testid="stFileUploaderDropzone"]:hover{
+  border-color: rgba(37,99,235,.55) !important;
+  background: rgba(37,99,235,.05) !important;
+}
+
+/* make the uploader centered and wide */
+.df-uploader-wrap{
+  width: min(760px, 92%);
+  margin: 12px auto 0 auto;
 }
 </style>
-""",
-        unsafe_allow_html=True,
+"""
+
+def inject_df_theme(app_title: str = "大豐物流部-WMS資料自動化助手", status_text: str = "系統連線中"):
+    """全站一致風格：Topbar + Sidebar + Card + Uploader"""
+    st.markdown(THEME_CSS, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="df-topbar">
+          <div class="wrap">
+            <div class="title">{app_title}</div>
+            <div class="right">
+              <span>裝置</span>
+              <span class="df-pill"><span class="df-dot"></span>{status_text}</span>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
+def sidebar_brand():
+    st.sidebar.markdown(
+        """
+        <div class="df-brand">
+          <div class="logo">🚚</div>
+          <div>
+            <div class="name">大豐物流部</div>
+            <div class="sub">OPERATIONAL BI PLATFORM</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-# Backward compatibility (you曾經用 inject_purple_theme)
-def inject_purple_theme():
-    inject_logistics_theme()
+def page_title(text: str):
+    st.markdown(
+        f"""
+        <div class="df-page-title">
+          <div class="bar"></div>
+          <div class="txt">{text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-
-# =========================================================
-# Page helpers
-# =========================================================
-def set_page(title: str, icon: str = "🏭"):
-    """
-    Consistent page header/title block.
-    Note: st.set_page_config should be in app.py or each page's top-level.
-    """
-    inject_logistics_theme()
-    st.markdown(f"## {icon} {title}")
-
-
-def card_open(title: str):
-    st.markdown(f'<div class="_gt_card"><h3>{title}</h3>', unsafe_allow_html=True)
-
+def card_open():
+    st.markdown('<div class="df-card">', unsafe_allow_html=True)
 
 def card_close():
     st.markdown("</div>", unsafe_allow_html=True)
-
-
-# =========================================================
-# KPI / Metrics
-# =========================================================
-@dataclass
-class KPI:
-    label: str
-    value: str
-    delta: Optional[str] = None
-    variant: str = "blue"  # reserved for future
-
-
-def render_kpis(kpis: Sequence[KPI], cols: Optional[int] = None):
-    if not kpis:
-        return
-    n = cols or min(5, len(kpis))
-    columns = st.columns(n)
-    for i, k in enumerate(kpis):
-        with columns[i % n]:
-            if k.delta is None:
-                st.metric(label=k.label, value=k.value)
-            else:
-                st.metric(label=k.label, value=k.value, delta=k.delta)
-
-
-# =========================================================
-# Charts (no plotly dependency)
-# =========================================================
-def bar_topN(
-    df: pd.DataFrame,
-    x_col: str,
-    y_col: str,
-    hover_cols: Optional[List[str]] = None,
-    top_n: int = 30,
-    target: Optional[float] = None,
-    title: str = "",
-):
-    """
-    Render a Top N bar chart using Altair (built-in friendly).
-    """
-    if df is None or df.empty:
-        st.info("無資料可視覺化")
-        return
-
-    data = df.copy()
-    data = data[[c for c in [x_col, y_col] + (hover_cols or []) if c in data.columns]].copy()
-    data[y_col] = pd.to_numeric(data[y_col], errors="coerce")
-    data = data.dropna(subset=[y_col])
-
-    data = data.sort_values(y_col, ascending=False).head(int(top_n))
-
-    # Try to use Altair if available; fallback to st.bar_chart
-    try:
-        import altair as alt  # type: ignore
-
-        base = alt.Chart(data).mark_bar().encode(
-            x=alt.X(f"{y_col}:Q", title=y_col),
-            y=alt.Y(f"{x_col}:N", sort="-x", title=""),
-            tooltip=[c for c in [x_col, y_col] + (hover_cols or []) if c in data.columns],
-        ).properties(height=min(560, 28 * max(6, len(data))))
-
-        layers = [base]
-
-        if target is not None:
-            rule = alt.Chart(pd.DataFrame({"target": [float(target)]})).mark_rule(strokeDash=[6, 4]).encode(
-                x="target:Q"
-            )
-            layers.append(rule)
-
-        chart = alt.layer(*layers)
-        if title:
-            st.caption(title)
-
-        st.altair_chart(chart, use_container_width=True)
-
-    except Exception:
-        # fallback
-        st.bar_chart(data.set_index(x_col)[y_col])
-
-
-# =========================================================
-# Table blocks
-# =========================================================
-def table_block(
-    summary_title: str,
-    summary_df: pd.DataFrame,
-    detail_title: str = "",
-    detail_df: Optional[pd.DataFrame] = None,
-    detail_expanded: bool = False,
-):
-    card_open(summary_title)
-    if summary_df is None or summary_df.empty:
-        st.info("目前沒有可顯示的資料")
-    else:
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-    card_close()
-
-    if detail_title:
-        with st.expander(detail_title, expanded=detail_expanded):
-            if detail_df is None or detail_df.empty:
-                st.info("目前沒有明細資料")
-            else:
-                st.dataframe(detail_df, use_container_width=True, hide_index=True)
-
-
-# =========================================================
-# Downloads
-# =========================================================
-def download_excel(xlsx_bytes: bytes, filename: str = "KPI報表.xlsx"):
-    st.download_button(
-        label="📥 匯出KPI報表（Excel）",
-        data=xlsx_bytes,
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=False,
-    )
