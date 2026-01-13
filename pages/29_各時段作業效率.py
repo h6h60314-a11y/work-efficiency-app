@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import io
 import os
-import glob
 from io import StringIO
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -35,12 +33,6 @@ STATUS_NA = "未判斷"
 
 # ✅ 特殊工時（分鐘）：12點、13點只有 30 分鐘
 WORK_MINUTES_BY_HOUR = {12: 30, 13: 30}
-
-DEFAULT_DATA_DIR = str(Path.home() / "Desktop")
-DEFAULT_PATTERNS = ["*.csv", "*.txt", "*.xls", "*.xlsx", "*.xlsm"]
-
-# ✅ 你給的桌面檔案路徑（預設值）
-DEFAULT_PROD_FILE = r"C:\Users\User\Desktop\2026-01-13.xls"
 
 
 # =============================
@@ -114,15 +106,6 @@ def _safe_time(s: str) -> str:
         return s
     except Exception:
         return "08:00"
-
-
-def _bytes_sig(b: bytes) -> str:
-    if b is None:
-        return "0"
-    n = len(b)
-    head = b[:128]
-    tail = b[-128:] if n >= 128 else b
-    return f"{n}-{hash(head)}-{hash(tail)}"
 
 
 def _slot_minutes(hour: int) -> int:
@@ -333,11 +316,6 @@ def build_excel_bytes_with_formulas_and_colors(
         ws_mat.cell(row=r_idx, column=sum_tgt_col, value=f"=SUM({','.join(tgt_cells)})").number_format = "0.0000"
         ws_mat.cell(row=r_idx, column=sum_st_col, value=f'=IF({sum_tgt_cell}<=0,"",IF({sum_cell}>={sum_tgt_cell},"{STATUS_PASS}","{STATUS_FAIL}"))')
 
-    ws_mat.column_dimensions["A"].width = 10
-    ws_mat.column_dimensions["B"].width = 6
-    ws_mat.column_dimensions["C"].width = 14
-    ws_mat.column_dimensions["D"].width = 10
-
     for row in ws_mat.iter_rows(min_row=1, max_row=ws_mat.max_row, min_col=1, max_col=ws_mat.max_column):
         for cell in row:
             cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -365,7 +343,6 @@ def build_excel_bytes_with_formulas_and_colors(
         vol_letter = get_column_letter(vol_col)
         st_letter = get_column_letter(st_col)
         rng = f"{vol_letter}2:{vol_letter}{max_r}"
-
         ws_mat.conditional_formatting.add(rng, FormulaRule(formula=[f'${st_letter}2="{STATUS_PASS}"'], fill=fill_ok, stopIfTrue=True))
         ws_mat.conditional_formatting.add(rng, FormulaRule(formula=[f'${st_letter}2="{STATUS_FAIL}"'], fill=fill_ng, stopIfTrue=True))
         ws_mat.conditional_formatting.add(rng, FormulaRule(formula=[f'${st_letter}2=""'], fill=fill_na, stopIfTrue=True))
@@ -373,7 +350,6 @@ def build_excel_bytes_with_formulas_and_colors(
     sum_letter = get_column_letter(sum_col)
     sum_st_letter = get_column_letter(sum_st_col)
     sum_rng = f"{sum_letter}2:{sum_letter}{max_r}"
-
     ws_mat.conditional_formatting.add(sum_rng, FormulaRule(formula=[f'${sum_st_letter}2="{STATUS_PASS}"'], fill=fill_ok, stopIfTrue=True))
     ws_mat.conditional_formatting.add(sum_rng, FormulaRule(formula=[f'${sum_st_letter}2="{STATUS_FAIL}"'], fill=fill_ng, stopIfTrue=True))
     ws_mat.conditional_formatting.add(sum_rng, FormulaRule(formula=[f'${sum_st_letter}2=""'], fill=fill_na, stopIfTrue=True))
@@ -384,41 +360,7 @@ def build_excel_bytes_with_formulas_and_colors(
 
 
 # =============================
-# ✅ 讀桌面資料夾最新檔（備用模式）
-# =============================
-def list_recent_files(data_dir: str, patterns: list[str], max_files: int) -> list[str]:
-    paths: list[str] = []
-    for pat in patterns:
-        paths += glob.glob(os.path.join(data_dir, pat))
-    paths = [p for p in paths if os.path.isfile(p)]
-    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return paths[: max(1, int(max_files))]
-
-
-def load_folder_prod_df(data_dir: str, patterns: list[str], max_files: int) -> pd.DataFrame:
-    files = list_recent_files(data_dir, patterns, max_files)
-    if not files:
-        return pd.DataFrame()
-
-    frames = []
-    for p in files:
-        try:
-            with open(p, "rb") as f:
-                raw = f.read()
-            df = read_table_robust(os.path.basename(p), raw, label=f"生產資料（{os.path.basename(p)}）")
-            df["__source__"] = os.path.basename(p)
-            df["__mtime__"] = datetime.fromtimestamp(os.path.getmtime(p), tz=TPE)
-            frames.append(df)
-        except Exception:
-            continue
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-# =============================
-# ✅ 即時看板（你圖片那種樣式）
+# ✅ 即時看板 UI（你圖片那種）
 # =============================
 def _board_css():
     st.markdown(
@@ -468,8 +410,7 @@ def render_realtime_board(board_df: pd.DataFrame, target_hr: float, now_h: int, 
     )
 
     show = board_df.copy()
-    show["__sort__"] = show["線別"].astype(str)
-    show = show.sort_values("__sort__").drop(columns=["__sort__"])
+    show = show.sort_values("線別")
 
     for _, r in show.iterrows():
         line = str(r["線別"])
@@ -515,7 +456,7 @@ def main():
         inject_logistics_theme()
         set_page("📦 出貨課", "⏱️ 29｜各時段作業效率")
 
-    st.markdown("### ⏱️ 各時段作業效率（本機桌面檔案即時看板｜支援 WMS 假 .xls TSV）")
+    st.markdown("### ⏱️ 各時段作業效率（Streamlit Cloud：資料夾多檔上傳｜支援 WMS 假 .xls TSV）")
 
     fixed_time_map = {
         "范明俊": "08:00", "阮玉名": "08:00", "李茂銓": "08:00", "河文強": "08:00",
@@ -529,23 +470,11 @@ def main():
     }
 
     with st.sidebar:
-        st.markdown("### 資料來源")
-        mode = st.radio("讀取方式", ["單一檔案路徑（本機）", "桌面資料夾最新檔（備用）"], index=0)
-
-        if mode == "單一檔案路徑（本機）":
-            prod_path = st.text_input("生產資料檔案路徑", value=DEFAULT_PROD_FILE)
-        else:
-            data_dir = st.text_input("WMS 匯出資料夾（預設桌面）", value=DEFAULT_DATA_DIR)
-            patterns = st.multiselect("讀取副檔名/樣式", options=DEFAULT_PATTERNS, default=DEFAULT_PATTERNS)
-            max_files = st.number_input("讀取最新檔案數", min_value=1, max_value=500, value=50, step=1)
-
-        lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24 * 60, value=180, step=10)
-
-        st.divider()
-
-        st.markdown("### 計算設定")
+        st.markdown("### 設定")
         target_hr = st.number_input("每小時目標（加權PCS/小時）", min_value=1.0, value=790.0, step=10.0)
         hour_min = st.number_input("起始小時", min_value=0, max_value=23, value=8, step=1)
+
+        lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24 * 60, value=180, step=10)
 
         use_now = st.toggle("用現在時間作為判斷截止（台北時間）", value=True)
         if use_now:
@@ -557,6 +486,7 @@ def main():
         st.caption(f"目前採用時間：{now.strftime('%Y-%m-%d %H:%M:%S')} (Asia/Taipei)")
 
         st.divider()
+        st.markdown("### 自動刷新")
         auto_refresh = st.toggle("自動刷新（建議 10~30 秒）", value=True)
         refresh_sec = st.number_input("刷新秒數", min_value=5, max_value=120, value=15, step=5)
 
@@ -569,35 +499,34 @@ def main():
         if auto_refresh and HAS_AUTOREFRESH:
             st_autorefresh(interval=int(refresh_sec) * 1000, key="__29_autorefresh")
         elif auto_refresh and not HAS_AUTOREFRESH:
-            st.warning("未安裝 streamlit-autorefresh（可 pip install streamlit-autorefresh）")
+            st.warning("未安裝 streamlit-autorefresh（可在 requirements.txt 加：streamlit-autorefresh）")
 
         manual = st.button("🔄 立即刷新/重算", type="primary", use_container_width=True)
 
+    # ✅ Cloud：用「多檔上傳」取代本機資料夾讀取
+    prod_files = st.file_uploader(
+        "① 上傳『WMS 生產資料』（可多檔：CSV/TXT/XLS/XLSX；可全選上傳）",
+        type=["csv", "txt", "xls", "xlsx", "xlsm"],
+        accept_multiple_files=True,
+    )
     mem_file = st.file_uploader("② 上傳『人員名單』(CSV/Excel)", type=["csv", "xlsx", "xlsm", "xls"])
-    if mem_file is None:
-        st.info("請先上傳『人員名單』。")
+
+    if not prod_files or mem_file is None:
+        st.info("請上傳：① WMS 生產資料（可多檔） + ② 人員名單")
         return
 
-    top = st.columns([2, 1, 1, 1])
-    top[0].markdown("#### 指定時段計算")
-    h_from = top[1].selectbox("起", options=list(range(0, 24)), index=min(max(int(now.hour), 0), 23))
-    h_to = top[2].selectbox("訖", options=list(range(0, 24)), index=min(max(int(now.hour), 0), 23))
-    do_range_calc = top[3].button("計算", use_container_width=True)
+    # 觸發重新計算（上傳變更/設定變更/手動）
+    prod_sig = "-".join([f"{f.name}:{f.size}" for f in prod_files])
+    mem_sig = f"{mem_file.name}:{mem_file.size}"
+    settings_sig = f"{target_hr}-{hour_min}-{lookback_min}-{use_now}-{now.hour}-{now.minute}"
 
-    mem_sig = _bytes_sig(mem_file.getvalue())
-    settings_sig = f"{mode}-{lookback_min}-{target_hr}-{hour_min}-{use_now}-{now.hour}-{now.minute}-{h_from}-{h_to}"
-    if mode == "單一檔案路徑（本機）":
-        settings_sig += f"-{prod_path}"
-    else:
-        settings_sig += f"-{data_dir}-{patterns}-{max_files}"
-
-    last = st.session_state.get("_29_last_sig_local", None)
-    cur_sig = (mem_sig, settings_sig)
-    should_run = manual or (last != cur_sig) or do_range_calc
+    last = st.session_state.get("_29_last_sig_cloud", None)
+    cur_sig = (prod_sig, mem_sig, settings_sig)
+    should_run = manual or (last != cur_sig)
     if not should_run:
-        st.caption("（目前結果已是最新；參數/時間更新會自動刷新）")
+        st.caption("（目前結果已是最新；上傳檔案/設定變更會自動同步）")
         return
-    st.session_state["_29_last_sig_local"] = cur_sig
+    st.session_state["_29_last_sig_cloud"] = cur_sig
 
     try:
         # 人員名單解析
@@ -642,27 +571,16 @@ def main():
         line_start["開線時間"] = line_start["_m"].apply(lambda m: f"{int(m)//60:02d}:{int(m)%60:02d}")
         line_start = line_start.drop(columns=["_m"])
 
-        # 生產資料（本機單一檔 或 桌面資料夾）
-        if mode == "單一檔案路徑（本機）":
-            if not prod_path or not os.path.isfile(prod_path):
-                raise ValueError(f"找不到生產資料檔案：{prod_path}")
+        # 生產資料：多檔合併
+        frames = []
+        for f in prod_files:
+            raw = f.getvalue()
+            dfp = read_table_robust(f.name, raw, label=f"生產資料（{f.name}）")
+            dfp["__source__"] = f.name
+            frames.append(dfp)
 
-            with open(prod_path, "rb") as f:
-                raw = f.read()
-
-            df_raw = read_table_robust(os.path.basename(prod_path), raw, label="生產資料（本機檔案）")
-            df_raw["__source__"] = os.path.basename(prod_path)
-            df_raw["__mtime__"] = datetime.fromtimestamp(os.path.getmtime(prod_path), tz=TPE)
-
-        else:
-            if not data_dir or not os.path.isdir(data_dir):
-                raise ValueError(f"資料夾不存在或不可讀：{data_dir}")
-            df_raw = load_folder_prod_df(data_dir, patterns, int(max_files))
-            if df_raw.empty:
-                raise ValueError("桌面資料夾找不到可讀取的檔案（csv/txt/xls/xlsx），或檔案格式不正確。")
-
-        df_raw = _norm_cols(df_raw)
-        require_columns(df_raw, ["PICKDATE", "LINEID", "ZONEID", "PACKQTY", "Cweight"], "生產資料")
+        df_raw = _norm_cols(pd.concat(frames, ignore_index=True))
+        require_columns(df_raw, ["PICKDATE", "LINEID", "ZONEID", "PACKQTY", "Cweight"], "生產資料（合併）")
 
         df_raw["PICKDATE"] = pd.to_datetime(df_raw["PICKDATE"], errors="coerce")
         df_raw = df_raw[df_raw["PICKDATE"].notna()].copy()
@@ -679,6 +597,7 @@ def main():
         df_raw["PACKQTY"] = pd.to_numeric(df_raw["PACKQTY"], errors="coerce").fillna(0)
         df_raw["Cweight"] = pd.to_numeric(df_raw["Cweight"], errors="coerce").fillna(0)
 
+        # 去重（避免多檔重疊）
         rid_cols = [c for c in df_raw.columns if c not in ("__rid",)]
         df_raw["__rid"] = pd.util.hash_pandas_object(df_raw[rid_cols], index=False)
         df_raw = df_raw.drop_duplicates("__rid", keep="first").copy()
@@ -702,12 +621,10 @@ def main():
         df_in = df[df["納入計算"]].copy()
         cur_h, cur_m = now.hour, now.minute
 
-        src_note = ""
-        if "__source__" in df_in.columns:
-            src_note = f"｜來源：{df_in['__source__'].nunique()} 檔"
         st.caption(
             f"資料時間：{cutoff.strftime('%Y-%m-%d %H:%M')} ～ {max_ts.strftime('%Y-%m-%d %H:%M')}｜"
-            f"判斷截止：{now.strftime('%H:%M')}（{int(cur_h)}點；12/13=30分鐘）{src_note}"
+            f"判斷截止：{now.strftime('%H:%M')}（{int(cur_h)}點；12/13=30分鐘）｜"
+            f"來源檔：{df_in['__source__'].nunique()} 個"
         )
 
         st.divider()
@@ -727,24 +644,6 @@ def main():
         board["開線時間"] = board["開線時間"].fillna("08:00")
 
         render_realtime_board(board, target_hr=float(target_hr), now_h=int(cur_h), now_m=int(cur_m))
-
-        if do_range_calc:
-            h1, h2 = int(h_from), int(h_to)
-            if h1 <= h2:
-                mask = (df_in["小時"] >= h1) & (df_in["小時"] <= h2)
-            else:
-                mask = (df_in["小時"] >= h1) | (df_in["小時"] <= h2)
-
-            range_line = (
-                df_in[mask]
-                .groupby("線別", as_index=False)["加權PCS"].sum()
-                .rename(columns={"加權PCS": "指定時段加權PCS"})
-            )
-
-            st.divider()
-            st.markdown(f"## 指定時段計算：{h1:02d}:00 ～ {h2:02d}:59")
-            show_range = pd.merge(line_start, range_line, on="線別", how="left").fillna({"指定時段加權PCS": 0})
-            st.dataframe(show_range.sort_values("線別"), use_container_width=True)
 
         with st.expander("（進階）各線別各段每小時達標 Heatmap", expanded=False):
             hour_cols = list(range(int(hour_min), int(cur_h) + 1)) if int(cur_h) >= int(hour_min) else [int(cur_h)]
@@ -768,10 +667,7 @@ def main():
 
             minutes_worked = np.where(
                 hh > cur_h, 0,
-                np.where(
-                    hh < s_h, 0,
-                    np.where(hh == s_h, np.maximum(0, end_m - s_m), end_m)
-                )
+                np.where(hh < s_h, 0, np.where(hh == s_h, np.maximum(0, end_m - s_m), end_m))
             ).astype(float)
 
             hourly_full["本小時有效分鐘"] = minutes_worked
@@ -782,29 +678,12 @@ def main():
                 np.where(hourly_full["當小時加權PCS"] >= hourly_full["本小時目標"], STATUS_PASS, STATUS_FAIL)
             )
 
-            dist = (
-                hourly_full[hourly_full["狀態"].isin([STATUS_PASS, STATUS_FAIL])]
-                .groupby(["線別", "小時", "狀態"], as_index=False)
-                .size()
-                .rename(columns={"size": "count"})
-            )
-
-            eff_hour = int(cur_h)
             lines = sorted(keys["線別"].dropna().unique().tolist())
             for line in lines:
                 if HAS_COMMON_UI:
                     card_open(f"📦 {line}")
                 else:
                     st.markdown(f"### 📦 {line}")
-
-                dist_now = dist[(dist["線別"] == line) & (dist["小時"] == eff_hour)]
-                p, f, rate = _kpi_counts(dist_now)
-
-                a, b, c, d = st.columns(4)
-                a.metric("判斷小時", f"{eff_hour} 點")
-                b.metric("達標 段數", p)
-                c.metric("未達標 段數", f)
-                d.metric("達標 率", (f"{rate:.1f}%" if rate is not None else "—"))
 
                 df_line = hourly_full[hourly_full["線別"] == line][
                     ["線別", "段數", "姓名", "小時", "當小時加權PCS", "本小時目標", "狀態"]
