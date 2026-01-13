@@ -42,15 +42,14 @@ WORK_MINUTES_BY_HOUR = {12: 30, 13: 30}
 def read_table_robust(file_name: str, raw: bytes, label: str = "檔案") -> pd.DataFrame:
     ext = os.path.splitext(file_name)[1].lower()
 
-    # 先試 Excel（但 .xls 很常是文字檔）
+    # 1) 先試 Excel（但 WMS 的 .xls 常常其實是文字檔，失敗就往下走）
     if ext in (".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"):
         try:
             return pd.read_excel(io.BytesIO(raw))
         except Exception:
-            # ✅ 很多 WMS 的 .xls 其實是 TSV/CSV（文字檔），不要 raise，往下用文字解析
-            pass
+            pass  # 改用文字解析
 
-    # 文字檔解析：優先試 tab（TSV）
+    # 2) 文字檔解析：優先試 tab（TSV），再試常見分隔符
     encodings = ["utf-8-sig", "utf-8", "cp950", "big5", "ms950", "gb18030", "latin1"]
     seps = ["\t", ",", ";", "|"]
 
@@ -58,17 +57,23 @@ def read_table_robust(file_name: str, raw: bytes, label: str = "檔案") -> pd.D
     for enc in encodings:
         for sep in seps:
             try:
-                df = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=sep, engine="python", low_memory=False)
+                # ✅ pandas 新版：python engine 不支援 low_memory 參數 → 不要傳
+                df = pd.read_csv(
+                    io.BytesIO(raw),
+                    encoding=enc,
+                    sep=sep,
+                    engine="python",
+                )
                 if df.shape[1] <= 1:
                     continue
                 return df
             except Exception as e:
                 last_err = e
 
-    # 最後容錯：讓 pandas 自己猜分隔符
+    # 3) 最後容錯：讓 pandas 自己猜分隔符
     try:
         text = raw.decode("utf-8", errors="replace")
-        df = pd.read_csv(StringIO(text), sep=None, engine="python", low_memory=False)
+        df = pd.read_csv(StringIO(text), sep=None, engine="python")
         if df.shape[1] <= 1:
             raise ValueError("偵測不到有效分隔符，請確認檔案是否為真正表格檔。")
         return df
