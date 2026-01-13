@@ -36,11 +36,11 @@ STATUS_NA = "未判斷"
 # ✅ 特殊工時（分鐘）：12點、13點只有 30 分鐘
 WORK_MINUTES_BY_HOUR = {12: 30, 13: 30}
 
-# =========================================================
-# ✅ 預設：桌面資料夾（Windows / Linux 都適用）
-# =========================================================
 DEFAULT_DATA_DIR = str(Path.home() / "Desktop")
 DEFAULT_PATTERNS = ["*.csv", "*.txt", "*.xls", "*.xlsx", "*.xlsm"]
+
+# ✅ 你給的桌面檔案路徑（預設值）
+DEFAULT_PROD_FILE = r"C:\Users\User\Desktop\2026-01-13.xls"
 
 
 # =============================
@@ -55,7 +55,7 @@ def read_table_robust(file_name: str, raw: bytes, label: str = "檔案") -> pd.D
         try:
             return pd.read_excel(io.BytesIO(raw))
         except Exception:
-            # ✅ 很多 WMS 的 .xls 其實是 TSV/CSV（文字檔），這裡不要 raise，直接往下用文字解析
+            # ✅ 很多 WMS 的 .xls 其實是 TSV/CSV（文字檔），不要 raise，往下用文字解析
             pass
 
     # 文字檔解析：優先試 tab（TSV）
@@ -84,16 +84,16 @@ def read_table_robust(file_name: str, raw: bytes, label: str = "檔案") -> pd.D
         raise ValueError(f"{label} 讀取失敗（已嘗試多種編碼/分隔符）：{last_err} / 最終：{e}")
 
 
-def require_columns(df: pd.DataFrame, required: list, label: str):
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"{label} 缺少欄位：{missing}\n目前欄位：{list(df.columns)}")
-
-
 def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
+
+def require_columns(df: pd.DataFrame, required: list, label: str):
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{label} 缺少欄位：{missing}\n目前欄位：{list(df.columns)}")
 
 
 def clean_line(series: pd.Series) -> pd.Series:
@@ -127,6 +127,12 @@ def _bytes_sig(b: bytes) -> str:
 
 def _slot_minutes(hour: int) -> int:
     return int(WORK_MINUTES_BY_HOUR.get(int(hour), 60))
+
+
+def _time_str_min(t: str) -> int:
+    t = _safe_time(t)
+    hh, mm = t.split(":")
+    return int(hh) * 60 + int(mm)
 
 
 # =============================
@@ -212,14 +218,12 @@ def build_excel_bytes_with_formulas_and_colors(
     ws_mat = wb.create_sheet("時段量體_公式")
     ws_param = wb.create_sheet("參數")
 
-    # 參數表
     ws_param["A1"] = "now_h"; ws_param["B1"] = int(now_h)
     ws_param["A2"] = "now_m"; ws_param["B2"] = int(now_m)
     ws_param["A3"] = "target_hr"; ws_param["B3"] = float(target_hr)
     for r in range(1, 4):
         ws_param[f"A{r}"].font = Font(bold=True)
 
-    # Sheet1：完整明細
     cols = list(detail_df.columns)
     for c_idx, col in enumerate(cols, start=1):
         ws_detail.cell(row=1, column=c_idx, value=col).font = Font(bold=True)
@@ -239,7 +243,6 @@ def build_excel_bytes_with_formulas_and_colors(
             ws_detail.cell(row=r_idx, column=col_aw, value=f"={p_cell}*{w_cell}")
             ws_detail.cell(row=r_idx, column=col_aw).number_format = "0.0000"
 
-    # SUMIFS 定位
     detail_header_to_col = {ws_detail.cell(row=1, column=i).value: i for i in range(1, ws_detail.max_column + 1)}
     need = ["線別", "段數", "小時", "加權PCS", "納入計算"]
     for k in need:
@@ -330,7 +333,6 @@ def build_excel_bytes_with_formulas_and_colors(
         ws_mat.cell(row=r_idx, column=sum_tgt_col, value=f"=SUM({','.join(tgt_cells)})").number_format = "0.0000"
         ws_mat.cell(row=r_idx, column=sum_st_col, value=f'=IF({sum_tgt_cell}<=0,"",IF({sum_cell}>={sum_tgt_cell},"{STATUS_PASS}","{STATUS_FAIL}"))')
 
-    # 欄寬 / 對齊
     ws_mat.column_dimensions["A"].width = 10
     ws_mat.column_dimensions["B"].width = 6
     ws_mat.column_dimensions["C"].width = 14
@@ -340,7 +342,6 @@ def build_excel_bytes_with_formulas_and_colors(
         for cell in row:
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 隱藏目標/狀態欄，只留量體 + 加總
     start_col = 5
     for i, _h in enumerate(hour_cols):
         vol_col = start_col + i * 3
@@ -383,7 +384,7 @@ def build_excel_bytes_with_formulas_and_colors(
 
 
 # =============================
-# ✅ 從桌面資料夾讀最新檔
+# ✅ 讀桌面資料夾最新檔（備用模式）
 # =============================
 def list_recent_files(data_dir: str, patterns: list[str], max_files: int) -> list[str]:
     paths: list[str] = []
@@ -416,12 +417,9 @@ def load_folder_prod_df(data_dir: str, patterns: list[str], max_files: int) -> p
     return pd.concat(frames, ignore_index=True)
 
 
-def _time_str_min(t: str) -> int:
-    t = _safe_time(t)
-    hh, mm = t.split(":")
-    return int(hh) * 60 + int(mm)
-
-
+# =============================
+# ✅ 即時看板（你圖片那種樣式）
+# =============================
 def _board_css():
     st.markdown(
         """
@@ -517,7 +515,7 @@ def main():
         inject_logistics_theme()
         set_page("📦 出貨課", "⏱️ 29｜各時段作業效率")
 
-    st.markdown("### ⏱️ 各時段作業效率（桌面資料夾即時看板｜支援 WMS 假 .xls TSV）")
+    st.markdown("### ⏱️ 各時段作業效率（本機桌面檔案即時看板｜支援 WMS 假 .xls TSV）")
 
     fixed_time_map = {
         "范明俊": "08:00", "阮玉名": "08:00", "李茂銓": "08:00", "河文強": "08:00",
@@ -530,18 +528,22 @@ def main():
         "王建成": "09:00",
     }
 
-    # Sidebar
     with st.sidebar:
-        st.markdown("### 設定")
+        st.markdown("### 資料來源")
+        mode = st.radio("讀取方式", ["單一檔案路徑（本機）", "桌面資料夾最新檔（備用）"], index=0)
 
-        data_dir = st.text_input("WMS 匯出資料夾（預設桌面）", value=DEFAULT_DATA_DIR)
-        patterns = st.multiselect("讀取副檔名/樣式", options=DEFAULT_PATTERNS, default=DEFAULT_PATTERNS)
+        if mode == "單一檔案路徑（本機）":
+            prod_path = st.text_input("生產資料檔案路徑", value=DEFAULT_PROD_FILE)
+        else:
+            data_dir = st.text_input("WMS 匯出資料夾（預設桌面）", value=DEFAULT_DATA_DIR)
+            patterns = st.multiselect("讀取副檔名/樣式", options=DEFAULT_PATTERNS, default=DEFAULT_PATTERNS)
+            max_files = st.number_input("讀取最新檔案數", min_value=1, max_value=500, value=50, step=1)
 
-        max_files = st.number_input("讀取最新檔案數", min_value=1, max_value=500, value=50, step=1)
-        lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24*60, value=180, step=10)
+        lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24 * 60, value=180, step=10)
 
         st.divider()
 
+        st.markdown("### 計算設定")
         target_hr = st.number_input("每小時目標（加權PCS/小時）", min_value=1.0, value=790.0, step=10.0)
         hour_min = st.number_input("起始小時", min_value=0, max_value=23, value=8, step=1)
 
@@ -571,32 +573,34 @@ def main():
 
         manual = st.button("🔄 立即刷新/重算", type="primary", use_container_width=True)
 
-    # 人員名單仍用上傳
     mem_file = st.file_uploader("② 上傳『人員名單』(CSV/Excel)", type=["csv", "xlsx", "xlsm", "xls"])
     if mem_file is None:
-        st.info("請先上傳『人員名單』。生產資料會直接從桌面資料夾讀取最新檔案。")
+        st.info("請先上傳『人員名單』。")
         return
 
-    # 指定時段計算
     top = st.columns([2, 1, 1, 1])
     top[0].markdown("#### 指定時段計算")
     h_from = top[1].selectbox("起", options=list(range(0, 24)), index=min(max(int(now.hour), 0), 23))
     h_to = top[2].selectbox("訖", options=list(range(0, 24)), index=min(max(int(now.hour), 0), 23))
     do_range_calc = top[3].button("計算", use_container_width=True)
 
-    # 觸發重算
     mem_sig = _bytes_sig(mem_file.getvalue())
-    settings_sig = f"{data_dir}-{patterns}-{max_files}-{lookback_min}-{target_hr}-{hour_min}-{use_now}-{now.hour}-{now.minute}-{h_from}-{h_to}"
-    last = st.session_state.get("_29_last_sig_folder", None)
+    settings_sig = f"{mode}-{lookback_min}-{target_hr}-{hour_min}-{use_now}-{now.hour}-{now.minute}-{h_from}-{h_to}"
+    if mode == "單一檔案路徑（本機）":
+        settings_sig += f"-{prod_path}"
+    else:
+        settings_sig += f"-{data_dir}-{patterns}-{max_files}"
+
+    last = st.session_state.get("_29_last_sig_local", None)
     cur_sig = (mem_sig, settings_sig)
     should_run = manual or (last != cur_sig) or do_range_calc
     if not should_run:
-        st.caption("（目前結果已是最新；參數/時間或桌面檔案更新會自動刷新）")
+        st.caption("（目前結果已是最新；參數/時間更新會自動刷新）")
         return
-    st.session_state["_29_last_sig_folder"] = cur_sig
+    st.session_state["_29_last_sig_local"] = cur_sig
 
     try:
-        # 解析人員名單
+        # 人員名單解析
         df_mem_raw = _norm_cols(read_table_robust(mem_file.name, mem_file.getvalue(), label="人員名單檔案"))
 
         line_col_candidates = ["LINEID", "線別", "LineID", "LINE Id", "Line Id"]
@@ -638,16 +642,27 @@ def main():
         line_start["開線時間"] = line_start["_m"].apply(lambda m: f"{int(m)//60:02d}:{int(m)%60:02d}")
         line_start = line_start.drop(columns=["_m"])
 
-        # 讀桌面資料夾（最新檔）
-        if not data_dir or not os.path.isdir(data_dir):
-            raise ValueError(f"資料夾不存在或不可讀：{data_dir}")
+        # 生產資料（本機單一檔 或 桌面資料夾）
+        if mode == "單一檔案路徑（本機）":
+            if not prod_path or not os.path.isfile(prod_path):
+                raise ValueError(f"找不到生產資料檔案：{prod_path}")
 
-        df_raw = load_folder_prod_df(data_dir, patterns, int(max_files))
-        if df_raw.empty:
-            raise ValueError("桌面資料夾找不到可讀取的檔案（csv/txt/xls/xlsx），或檔案格式不正確。")
+            with open(prod_path, "rb") as f:
+                raw = f.read()
+
+            df_raw = read_table_robust(os.path.basename(prod_path), raw, label="生產資料（本機檔案）")
+            df_raw["__source__"] = os.path.basename(prod_path)
+            df_raw["__mtime__"] = datetime.fromtimestamp(os.path.getmtime(prod_path), tz=TPE)
+
+        else:
+            if not data_dir or not os.path.isdir(data_dir):
+                raise ValueError(f"資料夾不存在或不可讀：{data_dir}")
+            df_raw = load_folder_prod_df(data_dir, patterns, int(max_files))
+            if df_raw.empty:
+                raise ValueError("桌面資料夾找不到可讀取的檔案（csv/txt/xls/xlsx），或檔案格式不正確。")
 
         df_raw = _norm_cols(df_raw)
-        require_columns(df_raw, ["PICKDATE", "LINEID", "ZONEID", "PACKQTY", "Cweight"], "生產資料（桌面資料夾）")
+        require_columns(df_raw, ["PICKDATE", "LINEID", "ZONEID", "PACKQTY", "Cweight"], "生產資料")
 
         df_raw["PICKDATE"] = pd.to_datetime(df_raw["PICKDATE"], errors="coerce")
         df_raw = df_raw[df_raw["PICKDATE"].notna()].copy()
@@ -687,14 +702,16 @@ def main():
         df_in = df[df["納入計算"]].copy()
         cur_h, cur_m = now.hour, now.minute
 
+        src_note = ""
+        if "__source__" in df_in.columns:
+            src_note = f"｜來源：{df_in['__source__'].nunique()} 檔"
         st.caption(
-            f"資料夾：{data_dir}｜讀取最新 {int(max_files)} 檔｜"
             f"資料時間：{cutoff.strftime('%Y-%m-%d %H:%M')} ～ {max_ts.strftime('%Y-%m-%d %H:%M')}｜"
-            f"判斷截止：{now.strftime('%H:%M')}（{int(cur_h)}點；12/13=30分鐘）"
+            f"判斷截止：{now.strftime('%H:%M')}（{int(cur_h)}點；12/13=30分鐘）{src_note}"
         )
 
         st.divider()
-        st.markdown("## 即時看板（桌面檔案）")
+        st.markdown("## 即時看板")
 
         hourly_line = (
             df_in[df_in["小時"] == int(cur_h)]
@@ -711,7 +728,6 @@ def main():
 
         render_realtime_board(board, target_hr=float(target_hr), now_h=int(cur_h), now_m=int(cur_m))
 
-        # 指定時段計算
         if do_range_calc:
             h1, h2 = int(h_from), int(h_to)
             if h1 <= h2:
@@ -730,7 +746,6 @@ def main():
             show_range = pd.merge(line_start, range_line, on="線別", how="left").fillna({"指定時段加權PCS": 0})
             st.dataframe(show_range.sort_values("線別"), use_container_width=True)
 
-        # Heatmap（展開）
         with st.expander("（進階）各線別各段每小時達標 Heatmap", expanded=False):
             hour_cols = list(range(int(hour_min), int(cur_h) + 1)) if int(cur_h) >= int(hour_min) else [int(cur_h)]
             base_cols = ["線別", "段數", "姓名", "開始時間"]
@@ -799,7 +814,6 @@ def main():
                 if HAS_COMMON_UI:
                     card_close()
 
-        # Excel 下載
         st.divider()
         st.markdown("## 匯出 Excel（保留公式＋色塊自動更新）")
 
