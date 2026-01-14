@@ -111,6 +111,20 @@ def _time_str_to_time(t: str) -> time:
     return time(int(hh), int(mm), 0)
 
 
+def _ensure_tpe(series: pd.Series) -> pd.Series:
+    """
+    ✅ 統一時間欄位為 Asia/Taipei
+    - 若是 tz-naive：視為台北時間並 localize
+    - 若是 tz-aware：轉換為台北時間
+    """
+    s = series
+    # 先確保 datetime
+    s = pd.to_datetime(s, errors="coerce")
+    if s.dt.tz is None:
+        return s.dt.tz_localize(TPE)
+    return s.dt.tz_convert(TPE)
+
+
 # =========================================================
 # ✅ 午休規則：12:30–13:30 不算工時
 #   - 12:00–12:29:59 算
@@ -172,7 +186,6 @@ def _effective_work_seconds_between(start_dt: datetime, end_dt: datetime) -> flo
         end_dt = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=TPE)
 
     total = 0.0
-    # 只需要掃 start 到 end 之間可能涵蓋的小時
     h0 = start_dt.hour
     h1 = end_dt.hour
     for h in range(int(h0), int(h1) + 1):
@@ -252,7 +265,7 @@ def render_hourly_heatmap(df_line_hourly: pd.DataFrame, hour_cols, title: str):
 
 # =============================
 # ✅ Excel：保留公式 + 色塊（條件格式）
-# ✅ 修正午休：12:30–13:30（13點工作區間是 13:30–14:00）
+# ✅ 午休：12:30–13:30（13點工作區間是 13:30–14:00）
 # =============================
 def build_excel_bytes_with_formulas_and_colors(
     detail_df: pd.DataFrame,
@@ -358,18 +371,14 @@ def build_excel_bytes_with_formulas_and_colors(
             ws_mat.cell(row=r_idx, column=vol_col, value=vol_formula).number_format = "0.0000"
 
             # ✅ 午休修正：12點=12:00~12:30；13點=13:30~14:00
-            # seg_s：該小時可算工時的起始分鐘（13點=30，其餘=0）
-            # seg_e：該小時可算工時的結束分鐘（12點=30；13點=60；其餘=60）
             seg_s = f"IF({h}=13,30,0)"
             seg_e = f"IF({h}=12,30,60)"
-
-            # 該小時「目前」可算到的分鐘（若是當前小時，取 now_m；否則取 seg_e）
             now_e = f"IF({h}={now_h_cell},{now_m_cell},{seg_e})"
             eff_e = f"MIN({now_e},{seg_e})"
 
             sh = f"HOUR({start_time_cell})"
             sm = f"MINUTE({start_time_cell})"
-            p_s = f"IF({h}={sh},{sm},0)"  # 人員在該小時的起始分鐘（0~59）
+            p_s = f"IF({h}={sh},{sm},0)"
 
             mins = (
                 f"IF({h}>{now_h_cell},0,"
@@ -536,7 +545,6 @@ def render_person_realtime_board(board_df: pd.DataFrame):
         else:
             bar_color = "#9ca3af"; dot = "#9ca3af"
 
-        # 累積狀態顏色（顯示在右下角）
         if status_total == STATUS_FAIL:
             total_color = "#dc2626"
         elif status_total == STATUS_PASS:
@@ -581,7 +589,6 @@ def main():
 
     st.markdown("### ⏱️ 各時段作業效率（每線×每段×每人 即時產能｜段數固定 1→4｜午休 12:30–13:30）")
 
-    # 人員固定起班時間（你可自行增修）
     fixed_time_map = {
         "范明俊": "08:00", "阮玉名": "08:00", "李茂銓": "08:00", "河文強": "08:00",
         "蔡麗珠": "08:00", "潘文一": "08:00", "阮伊黃": "08:00", "葉欲弘": "09:00",
@@ -593,13 +600,12 @@ def main():
         "王建成": "09:00",
     }
 
-    # ✅ Sidebar 只保留必要設定
     with st.sidebar:
         st.markdown("### 設定")
         target_hr = st.number_input("每人每小時目標（加權PCS/小時）", min_value=1.0, value=790.0, step=10.0)
         hour_min = st.number_input("起始小時（Heatmap 用）", min_value=0, max_value=23, value=8, step=1)
         lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24 * 60, value=180, step=10)
-        st.caption("即時目標以『現在時間』每秒計算；實績以你上傳資料累積。")
+        st.caption("目標用『現在時間』每秒計算；實績依你上傳資料累積；午休 12:30–13:30 不算。")
 
     prod_files = st.file_uploader(
         "① 上傳『WMS 生產資料』（可多檔：CSV/TXT/XLS/XLSX；可全選上傳）",
@@ -613,11 +619,10 @@ def main():
         return
 
     try:
-        # -------------------------
-        # 目前時間（用於每秒目標）
-        # -------------------------
+        # ✅ 現在時間（tz-aware）
         now = datetime.now(TPE)
         cur_h, cur_m, cur_s = int(now.hour), int(now.minute), int(now.second)
+        day = now.date()
 
         # -------------------------
         # 人員名單解析（每線×段×人）
@@ -655,7 +660,7 @@ def main():
         roster_df = roster_df[roster_df["段數"].notna()].copy()
         roster_df["段數"] = roster_df["段數"].astype(int)
 
-        # ✅ 你的設計：每線每段只保留一人（若同段多名請改成不 drop）
+        # ✅ 每線每段只留一人（你若要同段多名，改成不要 drop）
         roster_df = roster_df.drop_duplicates(["線別", "段數"], keep="first").copy()
         roster_df = roster_df[["線別", "段數", "姓名", "開始時間"]].copy()
 
@@ -672,10 +677,11 @@ def main():
         df_raw = _norm_cols(pd.concat(frames, ignore_index=True))
         require_columns(df_raw, ["PICKDATE", "LINEID", "ZONEID", "PACKQTY", "Cweight"], "生產資料（合併）")
 
-        df_raw["PICKDATE"] = pd.to_datetime(df_raw["PICKDATE"], errors="coerce")
+        # ✅ 解析時間 + 統一為台北時區（修正你遇到的 Invalid comparison）
+        df_raw["PICKDATE"] = _ensure_tpe(df_raw["PICKDATE"])
         df_raw = df_raw[df_raw["PICKDATE"].notna()].copy()
 
-        # ✅ 用「現在時間」做最近N分鐘切片（比較符合即時看板）
+        # ✅ 用現在時間做最近 N 分鐘切片（tz-aware 對 tz-aware，不會再報錯）
         cutoff = now - timedelta(minutes=int(lookback_min))
         df_raw = df_raw[df_raw["PICKDATE"] >= cutoff].copy()
 
@@ -725,16 +731,14 @@ def main():
         )
 
         # -------------------------
-        # ✅ 本小時 / 累積實績（以 roster 為底，沒資料也要出現）
+        # 本小時 / 累積實績（以 roster 為底，沒資料也要出現）
         # -------------------------
-        # 本小時累積實績（cur_h）
         hourly_person = (
             df_in[df_in["小時"] == cur_h]
             .groupby(["線別", "段數"], as_index=False)["加權PCS"].sum()
             .rename(columns={"加權PCS": "每小時分揀量"})
         ) if not df_in.empty else pd.DataFrame(columns=["線別", "段數", "每小時分揀量"])
 
-        # 總累積實績（全段）
         total_person = (
             df_in.groupby(["線別", "段數"], as_index=False)["加權PCS"].sum()
             .rename(columns={"加權PCS": "已分揀總量"})
@@ -748,16 +752,12 @@ def main():
 
         # -------------------------
         # ✅ 目標（每秒）
-        #   - 本小時目標：依當前秒數 + 午休規則 + 起班時間
-        #   - 累積目標：起班到現在的有效工作秒數（扣午休）
         # -------------------------
-        day = now.date()
-
         def _calc_targets(row) -> tuple[float, float]:
             stime = _safe_time(row["開始時間"])
             st_dt = datetime.combine(day, _time_str_to_time(stime)).replace(tzinfo=TPE)
 
-            # 本小時：只算「當小時有效工作區間」與 [起班, now] 的交集秒數
+            # 本小時：當小時有效工作區間 與 [起班, now] 的交集秒數
             seg = _hour_work_segment(day, cur_h)
             if seg is None:
                 sec_h = 0.0
@@ -776,20 +776,16 @@ def main():
         person_board["本小時目標"] = tgts[0].astype(float)
         person_board["累積目標"] = tgts[1].astype(float)
 
-        # 狀態：本小時
         person_board["狀態"] = np.where(
             person_board["本小時目標"] <= 1e-12,
             None,
             np.where(person_board["每小時分揀量"] >= person_board["本小時目標"], STATUS_PASS, STATUS_FAIL),
         )
-
-        # 狀態：累積
         person_board["累積狀態"] = np.where(
             person_board["累積目標"] <= 1e-12,
             None,
             np.where(person_board["已分揀總量"] >= person_board["累積目標"], STATUS_PASS, STATUS_FAIL),
         )
-
         person_board["排序_未達標優先"] = np.where(
             person_board["狀態"] == STATUS_FAIL, 0,
             np.where(person_board["狀態"] == STATUS_PASS, 1, 2)
@@ -852,7 +848,6 @@ def main():
                 df_line = df_line.sort_values(["段數", "排序_未達標優先", "姓名"], ascending=[True, True, True]).head(int(topn))
                 render_person_realtime_board(df_line)
 
-                # Heatmap：仍以小時為單位（但 12/13 小時目標會正確）
                 with st.expander("（進階）本線各段各人：每小時達標 Heatmap", expanded=False):
                     if df_in.empty:
                         st.info("目前沒有納入計算的生產資料。")
@@ -869,7 +864,6 @@ def main():
                         hourly_full = grid_hours.merge(hourly_sum, on=base_cols + ["小時"], how="left")
                         hourly_full["當小時加權PCS"] = pd.to_numeric(hourly_full["當小時加權PCS"], errors="coerce").fillna(0.0)
 
-                        # 本小時目標（分鐘）— 修正午休：12點算前30，13點算後30
                         parts = hourly_full["開始時間"].astype(str).str.split(":", n=1, expand=True)
                         s_h = pd.to_numeric(parts[0], errors="coerce").fillna(8).astype(int)
                         s_m = pd.to_numeric(parts[1], errors="coerce").fillna(0).astype(int)
@@ -878,7 +872,6 @@ def main():
                         seg_s = np.where(hh == 13, 30.0, 0.0)
                         seg_e = np.where(hh == 12, 30.0, 60.0)
 
-                        # 這個小時目前可以算到哪個分鐘（若是當前小時，用 now 的分鐘＋秒；否則到 seg_e）
                         now_min_float = float(cur_m) + float(cur_s) / 60.0
                         eff_e = np.where(hh == cur_h, np.minimum(now_min_float, seg_e), seg_e)
 
@@ -911,6 +904,13 @@ def main():
         detail_df = df.copy().sort_values(["線別", "段數", "PICKDATE"]).reset_index(drop=True)
         if "加權PCS" not in detail_df.columns:
             detail_df["加權PCS"] = np.nan
+
+        # ✅ Excel 友善：避免 tz-aware datetime 直接寫入造成問題 → 轉字串
+        if "PICKDATE" in detail_df.columns:
+            try:
+                detail_df["PICKDATE"] = detail_df["PICKDATE"].dt.tz_convert(TPE).dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
 
         hour_cols = list(range(int(hour_min), int(cur_h) + 1)) if int(cur_h) >= int(hour_min) else [int(cur_h)]
         xlsx_bytes = build_excel_bytes_with_formulas_and_colors(
