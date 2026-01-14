@@ -158,7 +158,10 @@ def _hour_work_segment(day: date, hour: int) -> tuple[datetime, datetime] | None
         )
     return (
         datetime(d.year, d.month, d.day, int(hour), 0, 0, tzinfo=TPE),
-        datetime(d.year, d.month, d.day, int(hour) + 1, 0, 0, tzinfo=TPE),
+        # 注意：23點時 hour+1=24 會爆，這裡做保護
+        datetime(d.year, d.month, d.day, int(hour) + 1, 0, 0, tzinfo=TPE)
+        if int(hour) < 23
+        else datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=TPE),
     )
 
 
@@ -462,7 +465,7 @@ def build_excel_bytes_with_formulas_and_colors(
 
 # =============================
 # ✅ 即時看板 UI（每線每段每人）
-# ✅ 右側「總量(累積)」顯示：線別實際加總（所有段/所有人加總）
+# ✅ 右側「總量(該線該段累計)」= 該線該段累積（不是全線加總）
 # =============================
 def _board_css():
     st.markdown(
@@ -504,7 +507,7 @@ def render_person_realtime_board(board_df: pd.DataFrame):
   <div class="h">線別｜段｜人｜開線</div>
   <div class="h">本小時(實績)</div>
   <div></div>
-  <div class="hr">總量(線別累積)</div>
+  <div class="hr">總量(該線該段累計)</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -521,10 +524,10 @@ def render_person_realtime_board(board_df: pd.DataFrame):
 
         hourly = float(r.get("每小時分揀量", 0.0))
 
-        # ✅ 右側總量(累積) → 改成「線別實際加總」
-        total_line = float(r.get("線別累積總量", 0.0))
-        tgt_line = float(r.get("線別累積目標", 0.0))
-        status_line = r.get("線別累積狀態", None)
+        # ✅ 右側總量(累積) → 該線該段累計（= groupby 線別+段數 的累積）
+        total_seg = float(r.get("已分揀總量", 0.0))
+        tgt_seg = float(r.get("累積目標", 0.0))
+        status_seg = r.get("累積狀態", None)
 
         tgt_h = float(r.get("本小時目標", 0.0))
         status_h = r.get("狀態", None)
@@ -540,9 +543,9 @@ def render_person_realtime_board(board_df: pd.DataFrame):
         else:
             bar_color = "#9ca3af"; dot = "#9ca3af"
 
-        if status_line == STATUS_FAIL:
+        if status_seg == STATUS_FAIL:
             total_color = "#dc2626"
-        elif status_line == STATUS_PASS:
+        elif status_seg == STATUS_PASS:
             total_color = "#16a34a"
         else:
             total_color = "#6b7280"
@@ -567,8 +570,8 @@ def render_person_realtime_board(board_df: pd.DataFrame):
   </div>
 
   <div>
-    <div class="board-total">{total_line:,.0f}</div>
-    <div class="board-sub" style="color:{total_color};">線別累積目標 {tgt_line:,.0f}</div>
+    <div class="board-total">{total_seg:,.0f}</div>
+    <div class="board-sub" style="color:{total_color};">累積目標 {tgt_seg:,.0f}</div>
   </div>
 </div>
 """,
@@ -655,7 +658,7 @@ def main():
         roster_df = roster_df[roster_df["段數"].notna()].copy()
         roster_df["段數"] = roster_df["段數"].astype(int)
 
-        # ✅ 每線每段只留一人（你若要同段多名，改成不要 drop）
+        # ✅ 每線每段只留一人（你若要同段多名 → 把這行刪掉）
         roster_df = roster_df.drop_duplicates(["線別", "段數"], keep="first").copy()
         roster_df = roster_df[["線別", "段數", "姓名", "開始時間"]].copy()
 
@@ -672,7 +675,7 @@ def main():
         df_raw = _norm_cols(pd.concat(frames, ignore_index=True))
         require_columns(df_raw, ["PICKDATE", "LINEID", "ZONEID", "PACKQTY", "Cweight"], "生產資料（合併）")
 
-        # ✅ 解析時間 + 統一為台北時區
+        # ✅ 解析時間 + 統一為台北時區（修正 dtype datetime64[ns] vs datetime）
         df_raw["PICKDATE"] = _ensure_tpe(df_raw["PICKDATE"])
         df_raw = df_raw[df_raw["PICKDATE"].notna()].copy()
 
@@ -725,7 +728,7 @@ def main():
         )
 
         # -------------------------
-        # 本小時 / 累積實績（以 roster 為底）
+        # 本小時 / 累積實績（該線該段）
         # -------------------------
         if df_in.empty:
             hourly_person = pd.DataFrame(columns=["線別", "段數", "每小時分揀量"])
@@ -746,17 +749,6 @@ def main():
         )
         person_board["已分揀總量"] = pd.to_numeric(person_board["已分揀總量"], errors="coerce").fillna(0.0)
         person_board["每小時分揀量"] = pd.to_numeric(person_board["每小時分揀量"], errors="coerce").fillna(0.0)
-
-        # ✅ 先算「線別實際累積總量」（你要的右側總量）
-        if df_in.empty:
-            line_total_df = pd.DataFrame({"線別": person_board["線別"].unique(), "線別累積總量": 0.0})
-        else:
-            line_total_df = (
-                df_in.groupby(["線別"], as_index=False)["加權PCS"].sum()
-                .rename(columns={"加權PCS": "線別累積總量"})
-            )
-        person_board = person_board.merge(line_total_df, on="線別", how="left")
-        person_board["線別累積總量"] = pd.to_numeric(person_board["線別累積總量"], errors="coerce").fillna(0.0)
 
         # -------------------------
         # ✅ 目標（每秒）
@@ -784,26 +776,18 @@ def main():
         person_board["本小時目標"] = pd.to_numeric(tgts[0], errors="coerce").fillna(0.0)
         person_board["累積目標"] = pd.to_numeric(tgts[1], errors="coerce").fillna(0.0)
 
+        # ✅ 本小時達標狀態
         person_board["狀態"] = np.where(
             person_board["本小時目標"] <= 1e-12,
             None,
             np.where(person_board["每小時分揀量"] >= person_board["本小時目標"], STATUS_PASS, STATUS_FAIL),
         )
 
-        # ✅ 線別累積目標（把該線所有人的「累積目標」加總）
-        line_tgt_df = (
-            person_board.groupby("線別", as_index=False)["累積目標"]
-            .sum()
-            .rename(columns={"累積目標": "線別累積目標"})
-        )
-        person_board = person_board.merge(line_tgt_df, on="線別", how="left")
-        person_board["線別累積目標"] = pd.to_numeric(person_board["線別累積目標"], errors="coerce").fillna(0.0)
-
-        # ✅ 線別累積達標狀態（用線別總量 vs 線別總目標判斷）
-        person_board["線別累積狀態"] = np.where(
-            person_board["線別累積目標"] <= 1e-12,
+        # ✅ 累積達標狀態（該線該段）
+        person_board["累積狀態"] = np.where(
+            person_board["累積目標"] <= 1e-12,
             None,
-            np.where(person_board["線別累積總量"] >= person_board["線別累積目標"], STATUS_PASS, STATUS_FAIL),
+            np.where(person_board["已分揀總量"] >= person_board["累積目標"], STATUS_PASS, STATUS_FAIL),
         )
 
         person_board["排序_未達標優先"] = np.where(
@@ -815,7 +799,7 @@ def main():
         # UI
         # -------------------------
         st.divider()
-        st.markdown("## 即時看板（每線一個視窗｜段數固定 1→4｜右側=線別實際累積加總）")
+        st.markdown("## 即時看板（每線一個視窗｜段數固定 1→4｜右側=該線該段累計）")
 
         all_lines = sorted(person_board["線別"].dropna().unique().tolist())
         if not all_lines:
@@ -928,7 +912,10 @@ def main():
         # ✅ Excel 友善：避免 tz-aware datetime 直接寫入造成問題 → 轉字串
         if "PICKDATE" in detail_df.columns:
             try:
-                detail_df["PICKDATE"] = detail_df["PICKDATE"].dt.tz_convert(TPE).dt.strftime("%Y-%m-%d %H:%M:%S")
+                detail_df["PICKDATE"] = pd.to_datetime(detail_df["PICKDATE"], errors="coerce")
+                if getattr(detail_df["PICKDATE"].dt, "tz", None) is not None:
+                    detail_df["PICKDATE"] = detail_df["PICKDATE"].dt.tz_convert(TPE)
+                detail_df["PICKDATE"] = detail_df["PICKDATE"].dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 pass
 
