@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import os
 from io import StringIO
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -21,6 +21,7 @@ from openpyxl.formatting.rule import FormulaRule
 # ---- 套用平台風格（有就用，沒有就退回原生）----
 try:
     from common_ui import inject_logistics_theme, set_page, card_open, card_close
+
     HAS_COMMON_UI = True
 except Exception:
     HAS_COMMON_UI = False
@@ -30,9 +31,6 @@ TPE = ZoneInfo("Asia/Taipei")
 STATUS_PASS = "達標"
 STATUS_FAIL = "未達標"
 STATUS_NA = "未判斷"
-
-# ✅ 特殊工時（分鐘）：12點、13點只有 30 分鐘
-WORK_MINUTES_BY_HOUR = {12: 30, 13: 30}
 
 
 # =========================================================
@@ -107,14 +105,83 @@ def _safe_time(s: str) -> str:
         return "08:00"
 
 
-def _slot_minutes(hour: int) -> int:
-    return int(WORK_MINUTES_BY_HOUR.get(int(hour), 60))
-
-
-def _time_str_min(t: str) -> int:
+def _time_str_to_time(t: str) -> time:
     t = _safe_time(t)
     hh, mm = t.split(":")
-    return int(hh) * 60 + int(mm)
+    return time(int(hh), int(mm), 0)
+
+
+# =========================================================
+# ✅ 午休規則：12:30–13:30 不算工時
+#   - 12:00–12:29:59 算
+#   - 13:30–13:59:59 算
+# =========================================================
+def _is_work_time(ts: pd.Timestamp) -> bool:
+    # 午休：12:30:00 ~ 13:29:59
+    h = int(ts.hour)
+    m = int(ts.minute)
+    if h == 12 and m >= 30:
+        return False
+    if h == 13 and m < 30:
+        return False
+    return True
+
+
+def _hour_work_segment(day: date, hour: int) -> tuple[datetime, datetime] | None:
+    """
+    回傳某小時內的「有效工作區間」(start_dt, end_dt)：
+    - 12點：12:00–12:30
+    - 13點：13:30–14:00
+    - 其他：hour:00–hour+1:00
+    """
+    d = day
+    if hour == 12:
+        return (
+            datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=TPE),
+            datetime(d.year, d.month, d.day, 12, 30, 0, tzinfo=TPE),
+        )
+    if hour == 13:
+        return (
+            datetime(d.year, d.month, d.day, 13, 30, 0, tzinfo=TPE),
+            datetime(d.year, d.month, d.day, 14, 0, 0, tzinfo=TPE),
+        )
+    return (
+        datetime(d.year, d.month, d.day, int(hour), 0, 0, tzinfo=TPE),
+        datetime(d.year, d.month, d.day, int(hour) + 1, 0, 0, tzinfo=TPE),
+    )
+
+
+def _overlap_seconds(a0: datetime, a1: datetime, b0: datetime, b1: datetime) -> float:
+    s = max(a0, b0)
+    e = min(a1, b1)
+    if e <= s:
+        return 0.0
+    return float((e - s).total_seconds())
+
+
+def _effective_work_seconds_between(start_dt: datetime, end_dt: datetime) -> float:
+    """
+    計算 start_dt ~ end_dt 之間，扣除午休後的有效工作秒數（每秒精準）。
+    """
+    if end_dt <= start_dt:
+        return 0.0
+
+    day = start_dt.date()
+    if end_dt.date() != day:
+        # 這頁主要處理當天即時，跨日直接截到當天 23:59:59
+        end_dt = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=TPE)
+
+    total = 0.0
+    # 只需要掃 start 到 end 之間可能涵蓋的小時
+    h0 = start_dt.hour
+    h1 = end_dt.hour
+    for h in range(int(h0), int(h1) + 1):
+        seg = _hour_work_segment(day, h)
+        if seg is None:
+            continue
+        seg_s, seg_e = seg
+        total += _overlap_seconds(start_dt, end_dt, seg_s, seg_e)
+    return total
 
 
 # =============================
@@ -185,6 +252,7 @@ def render_hourly_heatmap(df_line_hourly: pd.DataFrame, hour_cols, title: str):
 
 # =============================
 # ✅ Excel：保留公式 + 色塊（條件格式）
+# ✅ 修正午休：12:30–13:30（13點工作區間是 13:30–14:00）
 # =============================
 def build_excel_bytes_with_formulas_and_colors(
     detail_df: pd.DataFrame,
@@ -289,12 +357,26 @@ def build_excel_bytes_with_formulas_and_colors(
             )
             ws_mat.cell(row=r_idx, column=vol_col, value=vol_formula).number_format = "0.0000"
 
-            slot = f'IF(OR({h}=12,{h}=13),30,60)'
-            endm = f'IF({h}={now_h_cell},MIN({now_m_cell},{slot}),{slot})'
-            sh = f'HOUR({start_time_cell})'
-            sm = f'MINUTE({start_time_cell})'
-            mins = f'IF({h}>{now_h_cell},0,IF({h}<{sh},0,IF({h}={sh},MAX(0,{endm}-{sm}),{endm})))'
-            tgt_formula = f'={target_hr_cell}*({mins})/60'
+            # ✅ 午休修正：12點=12:00~12:30；13點=13:30~14:00
+            # seg_s：該小時可算工時的起始分鐘（13點=30，其餘=0）
+            # seg_e：該小時可算工時的結束分鐘（12點=30；13點=60；其餘=60）
+            seg_s = f"IF({h}=13,30,0)"
+            seg_e = f"IF({h}=12,30,60)"
+
+            # 該小時「目前」可算到的分鐘（若是當前小時，取 now_m；否則取 seg_e）
+            now_e = f"IF({h}={now_h_cell},{now_m_cell},{seg_e})"
+            eff_e = f"MIN({now_e},{seg_e})"
+
+            sh = f"HOUR({start_time_cell})"
+            sm = f"MINUTE({start_time_cell})"
+            p_s = f"IF({h}={sh},{sm},0)"  # 人員在該小時的起始分鐘（0~59）
+
+            mins = (
+                f"IF({h}>{now_h_cell},0,"
+                f"IF({h}<{sh},0,"
+                f"MAX(0,{eff_e}-MAX({seg_s},{p_s}))))"
+            )
+            tgt_formula = f"={target_hr_cell}*({mins})/60"
             ws_mat.cell(row=r_idx, column=tgt_col, value=tgt_formula).number_format = "0.0000"
 
             st_formula = f'=IF({tgt_cell}<=0,"",IF({vol_cell}>={tgt_cell},"{STATUS_PASS}","{STATUS_FAIL}"))'
@@ -313,7 +395,11 @@ def build_excel_bytes_with_formulas_and_colors(
 
         ws_mat.cell(row=r_idx, column=sum_col, value=f"=SUM({','.join(sum_cells)})").number_format = "0.0000"
         ws_mat.cell(row=r_idx, column=sum_tgt_col, value=f"=SUM({','.join(tgt_cells)})").number_format = "0.0000"
-        ws_mat.cell(row=r_idx, column=sum_st_col, value=f'=IF({sum_tgt_cell}<=0,"",IF({sum_cell}>={sum_tgt_cell},"{STATUS_PASS}","{STATUS_FAIL}"))')
+        ws_mat.cell(
+            row=r_idx,
+            column=sum_st_col,
+            value=f'=IF({sum_tgt_cell}<=0,"",IF({sum_cell}>={sum_tgt_cell},"{STATUS_PASS}","{STATUS_FAIL}"))',
+        )
 
     for row in ws_mat.iter_rows(min_row=1, max_row=ws_mat.max_row, min_col=1, max_col=ws_mat.max_column):
         for cell in row:
@@ -342,16 +428,28 @@ def build_excel_bytes_with_formulas_and_colors(
         vol_letter = get_column_letter(vol_col)
         st_letter = get_column_letter(st_col)
         rng = f"{vol_letter}2:{vol_letter}{max_r}"
-        ws_mat.conditional_formatting.add(rng, FormulaRule(formula=[f'${st_letter}2="{STATUS_PASS}"'], fill=fill_ok, stopIfTrue=True))
-        ws_mat.conditional_formatting.add(rng, FormulaRule(formula=[f'${st_letter}2="{STATUS_FAIL}"'], fill=fill_ng, stopIfTrue=True))
-        ws_mat.conditional_formatting.add(rng, FormulaRule(formula=[f'${st_letter}2=""'], fill=fill_na, stopIfTrue=True))
+        ws_mat.conditional_formatting.add(
+            rng, FormulaRule(formula=[f'${st_letter}2="{STATUS_PASS}"'], fill=fill_ok, stopIfTrue=True)
+        )
+        ws_mat.conditional_formatting.add(
+            rng, FormulaRule(formula=[f'${st_letter}2="{STATUS_FAIL}"'], fill=fill_ng, stopIfTrue=True)
+        )
+        ws_mat.conditional_formatting.add(
+            rng, FormulaRule(formula=[f'${st_letter}2=""'], fill=fill_na, stopIfTrue=True)
+        )
 
     sum_letter = get_column_letter(sum_col)
     sum_st_letter = get_column_letter(sum_st_col)
     sum_rng = f"{sum_letter}2:{sum_letter}{max_r}"
-    ws_mat.conditional_formatting.add(sum_rng, FormulaRule(formula=[f'${sum_st_letter}2="{STATUS_PASS}"'], fill=fill_ok, stopIfTrue=True))
-    ws_mat.conditional_formatting.add(sum_rng, FormulaRule(formula=[f'${sum_st_letter}2="{STATUS_FAIL}"'], fill=fill_ng, stopIfTrue=True))
-    ws_mat.conditional_formatting.add(sum_rng, FormulaRule(formula=[f'${sum_st_letter}2=""'], fill=fill_na, stopIfTrue=True))
+    ws_mat.conditional_formatting.add(
+        sum_rng, FormulaRule(formula=[f'${sum_st_letter}2="{STATUS_PASS}"'], fill=fill_ok, stopIfTrue=True)
+    )
+    ws_mat.conditional_formatting.add(
+        sum_rng, FormulaRule(formula=[f'${sum_st_letter}2="{STATUS_FAIL}"'], fill=fill_ng, stopIfTrue=True)
+    )
+    ws_mat.conditional_formatting.add(
+        sum_rng, FormulaRule(formula=[f'${sum_st_letter}2=""'], fill=fill_na, stopIfTrue=True)
+    )
 
     out = io.BytesIO()
     wb.save(out)
@@ -361,22 +459,24 @@ def build_excel_bytes_with_formulas_and_colors(
 # =============================
 # ✅ 即時看板 UI（每線每段每人）
 # ✅ 段數固定 1→2→3→4（第一順位）
+# ✅ 目標「每秒更新」：本小時目標 + 累積目標（扣午休/依起班）
 # =============================
 def _board_css():
     st.markdown(
         """
 <style>
-.board-row { display: grid; grid-template-columns: 140px 160px 1fr 220px; gap: 14px;
+.board-row { display: grid; grid-template-columns: 160px 170px 1fr 260px; gap: 14px;
              align-items: center; padding: 10px 10px; border-bottom: 1px solid rgba(0,0,0,0.08); }
 .board-line { font-size: 40px; font-weight: 900; color:#1e40af; line-height: 1; }
 .board-start { font-size: 18px; font-weight: 700; color:#111827; margin-top:6px; }
-.board-hourly { font-size: 60px; font-weight: 900; color:#111827; text-align: right; line-height: 1; }
-.board-total { font-size: 60px; font-weight: 900; color:#111827; text-align: right; line-height: 1; }
+.board-hourly { font-size: 56px; font-weight: 900; color:#111827; text-align: right; line-height: 1; }
+.board-total { font-size: 56px; font-weight: 900; color:#111827; text-align: right; line-height: 1; }
+.board-sub { font-size: 18px; font-weight: 900; text-align:right; margin-top:6px; }
 .board-bar { width: 100%; height: 34px; background: #e5e7eb; border-radius: 4px; overflow: hidden; position: relative;}
 .board-bar > .fill { height: 100%; width: 0%; }
 .board-bar > .txt { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
                     font-size:20px; font-weight:900; color:#111827; }
-.board-head { display:grid; grid-template-columns: 140px 160px 1fr 220px; gap: 14px;
+.board-head { display:grid; grid-template-columns: 160px 170px 1fr 260px; gap: 14px;
               align-items:end; padding: 6px 10px 12px 10px; }
 .board-head .h { font-size: 22px; font-weight: 900; color:#1f2937; }
 .board-head .hr { font-size: 22px; font-weight: 900; color:#1f2937; text-align:right; }
@@ -399,9 +499,9 @@ def render_person_realtime_board(board_df: pd.DataFrame):
         """
 <div class="board-head">
   <div class="h">線別｜段｜人｜開線</div>
-  <div class="h">每小時分揀量</div>
+  <div class="h">本小時(累積)</div>
   <div></div>
-  <div class="hr">已分揀總量</div>
+  <div class="hr">總量(累積)</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -418,19 +518,31 @@ def render_person_realtime_board(board_df: pd.DataFrame):
 
         hourly = float(r.get("每小時分揀量", 0.0))
         total = float(r.get("已分揀總量", 0.0))
-        tgt = float(r.get("本小時目標", 0.0))
-        status = r.get("狀態", None)
+
+        tgt_h = float(r.get("本小時目標", 0.0))
+        tgt_total = float(r.get("累積目標", 0.0))
+
+        status_h = r.get("狀態", None)
+        status_total = r.get("累積狀態", None)
 
         pct = 0.0
-        if tgt > 0:
-            pct = max(0.0, min(hourly / tgt, 1.0)) * 100.0
+        if tgt_h > 0:
+            pct = max(0.0, min(hourly / tgt_h, 1.0)) * 100.0
 
-        if status == STATUS_FAIL:
+        if status_h == STATUS_FAIL:
             bar_color = "#dc2626"; dot = "#dc2626"
-        elif status == STATUS_PASS:
+        elif status_h == STATUS_PASS:
             bar_color = "#16a34a"; dot = "#16a34a"
         else:
             bar_color = "#9ca3af"; dot = "#9ca3af"
+
+        # 累積狀態顏色（顯示在右下角）
+        if status_total == STATUS_FAIL:
+            total_color = "#dc2626"
+        elif status_total == STATUS_PASS:
+            total_color = "#16a34a"
+        else:
+            total_color = "#6b7280"
 
         st.markdown(
             f"""
@@ -447,12 +559,13 @@ def render_person_realtime_board(board_df: pd.DataFrame):
   <div>
     <div class="board-bar">
       <div class="fill" style="width:{pct:.1f}%; background:{bar_color};"></div>
-      <div class="txt">目標 {tgt:,.0f}</div>
+      <div class="txt">本小時目標 {tgt_h:,.0f}</div>
     </div>
   </div>
 
   <div>
     <div class="board-total">{total:,.0f}</div>
+    <div class="board-sub" style="color:{total_color};">累積目標 {tgt_total:,.0f}</div>
   </div>
 </div>
 """,
@@ -466,8 +579,9 @@ def main():
         inject_logistics_theme()
         set_page("📦 出貨課", "⏱️ 29｜各時段作業效率")
 
-    st.markdown("### ⏱️ 各時段作業效率（每線×每段×每人 即時產能｜段數固定 1→4）")
+    st.markdown("### ⏱️ 各時段作業效率（每線×每段×每人 即時產能｜段數固定 1→4｜午休 12:30–13:30）")
 
+    # 人員固定起班時間（你可自行增修）
     fixed_time_map = {
         "范明俊": "08:00", "阮玉名": "08:00", "李茂銓": "08:00", "河文強": "08:00",
         "蔡麗珠": "08:00", "潘文一": "08:00", "阮伊黃": "08:00", "葉欲弘": "09:00",
@@ -479,13 +593,13 @@ def main():
         "王建成": "09:00",
     }
 
-    # ✅ Sidebar 只保留必要設定（你要移除的「截止時間/自動刷新/立即刷新」整段已刪掉）
+    # ✅ Sidebar 只保留必要設定
     with st.sidebar:
         st.markdown("### 設定")
-        target_hr = st.number_input("每小時目標（加權PCS/小時）", min_value=1.0, value=790.0, step=10.0)
+        target_hr = st.number_input("每人每小時目標（加權PCS/小時）", min_value=1.0, value=790.0, step=10.0)
         hour_min = st.number_input("起始小時（Heatmap 用）", min_value=0, max_value=23, value=8, step=1)
         lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24 * 60, value=180, step=10)
-        st.caption("本頁固定用『資料最新時間』作為判斷截止（避免沒有資料）。")
+        st.caption("即時目標以『現在時間』每秒計算；實績以你上傳資料累積。")
 
     prod_files = st.file_uploader(
         "① 上傳『WMS 生產資料』（可多檔：CSV/TXT/XLS/XLSX；可全選上傳）",
@@ -499,7 +613,15 @@ def main():
         return
 
     try:
-        # 人員名單解析
+        # -------------------------
+        # 目前時間（用於每秒目標）
+        # -------------------------
+        now = datetime.now(TPE)
+        cur_h, cur_m, cur_s = int(now.hour), int(now.minute), int(now.second)
+
+        # -------------------------
+        # 人員名單解析（每線×段×人）
+        # -------------------------
         df_mem_raw = _norm_cols(read_table_robust(mem_file.name, mem_file.getvalue(), label="人員名單檔案"))
 
         line_col_candidates = ["LINEID", "線別", "LineID", "LINE Id", "Line Id"]
@@ -532,10 +654,14 @@ def main():
         roster_df["段數"] = clean_zone_1to4(roster_df["段數"])
         roster_df = roster_df[roster_df["段數"].notna()].copy()
         roster_df["段數"] = roster_df["段數"].astype(int)
+
+        # ✅ 你的設計：每線每段只保留一人（若同段多名請改成不 drop）
         roster_df = roster_df.drop_duplicates(["線別", "段數"], keep="first").copy()
         roster_df = roster_df[["線別", "段數", "姓名", "開始時間"]].copy()
 
+        # -------------------------
         # 生產資料：多檔合併
+        # -------------------------
         frames = []
         for f in prod_files:
             raw = f.getvalue()
@@ -549,9 +675,11 @@ def main():
         df_raw["PICKDATE"] = pd.to_datetime(df_raw["PICKDATE"], errors="coerce")
         df_raw = df_raw[df_raw["PICKDATE"].notna()].copy()
 
-        max_ts = df_raw["PICKDATE"].max()
-        cutoff = max_ts - timedelta(minutes=int(lookback_min))
+        # ✅ 用「現在時間」做最近N分鐘切片（比較符合即時看板）
+        cutoff = now - timedelta(minutes=int(lookback_min))
         df_raw = df_raw[df_raw["PICKDATE"] >= cutoff].copy()
+
+        max_ts = df_raw["PICKDATE"].max() if not df_raw.empty else None
 
         df_raw = df_raw.rename(columns={"LINEID": "線別", "ZONEID": "段數"})
         df_raw["線別"] = clean_line(df_raw["線別"])
@@ -567,71 +695,99 @@ def main():
         df_raw["__rid"] = pd.util.hash_pandas_object(df_raw[rid_cols], index=False)
         df_raw = df_raw.drop_duplicates("__rid", keep="first").copy()
 
+        # 對 roster 綁定姓名 / 開始時間
         df = pd.merge(df_raw, roster_df, on=["線別", "段數"], how="left", validate="m:1")
         df["姓名"] = df["姓名"].fillna("未設定")
         df["開始時間"] = df["開始時間"].fillna("08:00").map(_safe_time)
 
+        # 拆時間（秒級）
         df["小時"] = df["PICKDATE"].dt.hour
-        df["PICK_MIN"] = df["PICKDATE"].dt.hour * 60 + df["PICKDATE"].dt.minute
+        df["PICK_SEC"] = df["PICKDATE"].dt.hour * 3600 + df["PICKDATE"].dt.minute * 60 + df["PICKDATE"].dt.second
 
-        st_parts = df["開始時間"].astype(str).str.split(":", n=1, expand=True)
-        st_h = pd.to_numeric(st_parts[0], errors="coerce").fillna(8).astype(int)
-        st_m = pd.to_numeric(st_parts[1], errors="coerce").fillna(0).astype(int)
-        df["開始分鐘"] = st_h * 60 + st_m
+        st_t = df["開始時間"].map(_time_str_to_time)
+        df["開始秒"] = st_t.map(lambda x: int(x.hour) * 3600 + int(x.minute) * 60).astype(int)
 
-        df["納入計算"] = df["PICK_MIN"] >= df["開始分鐘"]
-        df["排除原因"] = np.where(df["納入計算"], "", "早於開始時間")
+        # ✅ 納入計算：
+        # 1) 不早於開始時間
+        # 2) 午休 12:30–13:30 不算
+        is_work = df["PICKDATE"].apply(_is_work_time)
+        df["納入計算"] = (df["PICK_SEC"] >= df["開始秒"]) & is_work
+        df["排除原因"] = np.where(df["納入計算"], "", np.where(~is_work, "午休不算工時", "早於開始時間"))
+
         df["加權PCS"] = df["PACKQTY"] * df["Cweight"]
-
         df_in = df[df["納入計算"]].copy()
 
-        # ✅ 固定用資料最新時間當截止（避免沒有資料）
-        eval_now = max_ts
-        cur_h, cur_m = int(eval_now.hour), int(eval_now.minute)
-
         st.caption(
-            f"資料時間：{cutoff.strftime('%Y-%m-%d %H:%M')} ～ {max_ts.strftime('%Y-%m-%d %H:%M')}｜"
-            f"判斷截止：{eval_now.strftime('%Y-%m-%d %H:%M')}（資料最新）｜"
-            f"來源檔：{df_in['__source__'].nunique()} 個｜（12/13 小時只算 30 分鐘）"
+            f"看板時間：{now.strftime('%Y-%m-%d %H:%M:%S')}｜"
+            f"資料範圍：{cutoff.strftime('%Y-%m-%d %H:%M:%S')} ～ {(max_ts.strftime('%Y-%m-%d %H:%M:%S') if max_ts is not None else '—')}｜"
+            f"來源檔：{df_in['__source__'].nunique() if not df_in.empty else 0} 個｜"
+            f"午休：12:30–13:30 不算工時"
         )
 
-        # 本小時 / 累積（每線×每段）
+        # -------------------------
+        # ✅ 本小時 / 累積實績（以 roster 為底，沒資料也要出現）
+        # -------------------------
+        # 本小時累積實績（cur_h）
         hourly_person = (
             df_in[df_in["小時"] == cur_h]
             .groupby(["線別", "段數"], as_index=False)["加權PCS"].sum()
             .rename(columns={"加權PCS": "每小時分揀量"})
-        )
+        ) if not df_in.empty else pd.DataFrame(columns=["線別", "段數", "每小時分揀量"])
+
+        # 總累積實績（全段）
         total_person = (
             df_in.groupby(["線別", "段數"], as_index=False)["加權PCS"].sum()
             .rename(columns={"加權PCS": "已分揀總量"})
-        )
+        ) if not df_in.empty else pd.DataFrame(columns=["線別", "段數", "已分揀總量"])
 
-        person_board = pd.merge(total_person, hourly_person, on=["線別", "段數"], how="left")
+        person_board = roster_df.merge(total_person, on=["線別", "段數"], how="left").merge(
+            hourly_person, on=["線別", "段數"], how="left"
+        )
+        person_board["已分揀總量"] = person_board["已分揀總量"].fillna(0.0)
         person_board["每小時分揀量"] = person_board["每小時分揀量"].fillna(0.0)
 
-        person_board = pd.merge(person_board, roster_df, on=["線別", "段數"], how="left")
-        person_board["姓名"] = person_board["姓名"].fillna("未設定")
-        person_board["開始時間"] = person_board["開始時間"].fillna("08:00").map(_safe_time)
+        # -------------------------
+        # ✅ 目標（每秒）
+        #   - 本小時目標：依當前秒數 + 午休規則 + 起班時間
+        #   - 累積目標：起班到現在的有效工作秒數（扣午休）
+        # -------------------------
+        day = now.date()
 
-        slot = _slot_minutes(cur_h)
-        end_m = min(int(cur_m), int(slot))
+        def _calc_targets(row) -> tuple[float, float]:
+            stime = _safe_time(row["開始時間"])
+            st_dt = datetime.combine(day, _time_str_to_time(stime)).replace(tzinfo=TPE)
 
-        s_min = person_board["開始時間"].map(_time_str_min).astype(int)
-        s_hh = (s_min // 60).astype(int)
-        s_mm = (s_min % 60).astype(int)
+            # 本小時：只算「當小時有效工作區間」與 [起班, now] 的交集秒數
+            seg = _hour_work_segment(day, cur_h)
+            if seg is None:
+                sec_h = 0.0
+            else:
+                seg_s, seg_e = seg
+                sec_h = _overlap_seconds(st_dt, now, seg_s, seg_e)
 
-        mins_worked = np.where(
-            cur_h < s_hh, 0,
-            np.where(cur_h == s_hh, np.maximum(0, end_m - s_mm), end_m)
-        ).astype(float)
+            # 累積：起班到 now 的有效秒數（扣午休）
+            sec_total = _effective_work_seconds_between(st_dt, now)
 
-        person_board["本小時有效分鐘"] = mins_worked
-        person_board["本小時目標"] = (mins_worked / 60.0) * float(target_hr)
+            tgt_h = float(target_hr) * (sec_h / 3600.0)
+            tgt_total = float(target_hr) * (sec_total / 3600.0)
+            return tgt_h, tgt_total
 
+        tgts = person_board.apply(_calc_targets, axis=1, result_type="expand")
+        person_board["本小時目標"] = tgts[0].astype(float)
+        person_board["累積目標"] = tgts[1].astype(float)
+
+        # 狀態：本小時
         person_board["狀態"] = np.where(
-            person_board["本小時有效分鐘"] <= 0,
+            person_board["本小時目標"] <= 1e-12,
             None,
-            np.where(person_board["每小時分揀量"] >= person_board["本小時目標"], STATUS_PASS, STATUS_FAIL)
+            np.where(person_board["每小時分揀量"] >= person_board["本小時目標"], STATUS_PASS, STATUS_FAIL),
+        )
+
+        # 狀態：累積
+        person_board["累積狀態"] = np.where(
+            person_board["累積目標"] <= 1e-12,
+            None,
+            np.where(person_board["已分揀總量"] >= person_board["累積目標"], STATUS_PASS, STATUS_FAIL),
         )
 
         person_board["排序_未達標優先"] = np.where(
@@ -639,8 +795,11 @@ def main():
             np.where(person_board["狀態"] == STATUS_PASS, 1, 2)
         )
 
+        # -------------------------
+        # UI
+        # -------------------------
         st.divider()
-        st.markdown("## 即時看板（每線一個視窗｜段數固定 1→4）")
+        st.markdown("## 即時看板（每線一個視窗｜段數固定 1→4｜目標每秒更新）")
 
         all_lines = sorted(person_board["線別"].dropna().unique().tolist())
         if not all_lines:
@@ -685,53 +844,66 @@ def main():
                 p, f, rate = _kpi_counts(dist_now)
 
                 a, b, c, d = st.columns(4)
-                a.metric("判斷小時", f"{cur_h:02d} 點")
-                b.metric("達標 人數", p)
-                c.metric("未達標 人數", f)
-                d.metric("達標率", (f"{rate:.1f}%" if rate is not None else "—"))
+                a.metric("判斷時間", now.strftime("%H:%M:%S"))
+                b.metric("達標 人數(本小時)", p)
+                c.metric("未達標 人數(本小時)", f)
+                d.metric("達標率(本小時)", (f"{rate:.1f}%" if rate is not None else "—"))
 
                 df_line = df_line.sort_values(["段數", "排序_未達標優先", "姓名"], ascending=[True, True, True]).head(int(topn))
                 render_person_realtime_board(df_line)
 
+                # Heatmap：仍以小時為單位（但 12/13 小時目標會正確）
                 with st.expander("（進階）本線各段各人：每小時達標 Heatmap", expanded=False):
-                    hour_cols = list(range(int(hour_min), int(cur_h) + 1)) if int(cur_h) >= int(hour_min) else [int(cur_h)]
-                    base_cols = ["線別", "段數", "姓名", "開始時間"]
+                    if df_in.empty:
+                        st.info("目前沒有納入計算的生產資料。")
+                    else:
+                        hour_cols = list(range(int(hour_min), int(cur_h) + 1)) if int(cur_h) >= int(hour_min) else [int(cur_h)]
+                        base_cols = ["線別", "段數", "姓名", "開始時間"]
 
-                    df_line_in = df_in[df_in["線別"] == line].copy()
-                    hourly_sum = df_line_in.groupby(base_cols + ["小時"], as_index=False)["加權PCS"].sum()
-                    hourly_sum = hourly_sum.rename(columns={"加權PCS": "當小時加權PCS"})
+                        df_line_in = df_in[df_in["線別"] == line].copy()
+                        hourly_sum = df_line_in.groupby(base_cols + ["小時"], as_index=False)["加權PCS"].sum()
+                        hourly_sum = hourly_sum.rename(columns={"加權PCS": "當小時加權PCS"})
 
-                    keys = roster_df[roster_df["線別"] == line][base_cols].drop_duplicates().copy()
-                    grid_hours = keys.assign(_k=1).merge(pd.DataFrame({"小時": hour_cols, "_k": 1}), on="_k").drop(columns=["_k"])
-                    hourly_full = grid_hours.merge(hourly_sum, on=base_cols + ["小時"], how="left")
-                    hourly_full["當小時加權PCS"] = pd.to_numeric(hourly_full["當小時加權PCS"], errors="coerce").fillna(0.0)
+                        keys = roster_df[roster_df["線別"] == line][base_cols].drop_duplicates().copy()
+                        grid_hours = keys.assign(_k=1).merge(pd.DataFrame({"小時": hour_cols, "_k": 1}), on="_k").drop(columns=["_k"])
+                        hourly_full = grid_hours.merge(hourly_sum, on=base_cols + ["小時"], how="left")
+                        hourly_full["當小時加權PCS"] = pd.to_numeric(hourly_full["當小時加權PCS"], errors="coerce").fillna(0.0)
 
-                    parts = hourly_full["開始時間"].astype(str).str.split(":", n=1, expand=True)
-                    s_h = pd.to_numeric(parts[0], errors="coerce").fillna(8).astype(int)
-                    s_m = pd.to_numeric(parts[1], errors="coerce").fillna(0).astype(int)
-                    hh = pd.to_numeric(hourly_full["小時"], errors="coerce").fillna(0).astype(int)
+                        # 本小時目標（分鐘）— 修正午休：12點算前30，13點算後30
+                        parts = hourly_full["開始時間"].astype(str).str.split(":", n=1, expand=True)
+                        s_h = pd.to_numeric(parts[0], errors="coerce").fillna(8).astype(int)
+                        s_m = pd.to_numeric(parts[1], errors="coerce").fillna(0).astype(int)
+                        hh = pd.to_numeric(hourly_full["小時"], errors="coerce").fillna(0).astype(int)
 
-                    slot_arr = hh.map(lambda x: _slot_minutes(int(x))).astype(int)
-                    end_m_arr = np.where(hh == cur_h, np.minimum(cur_m, slot_arr), slot_arr).astype(int)
+                        seg_s = np.where(hh == 13, 30.0, 0.0)
+                        seg_e = np.where(hh == 12, 30.0, 60.0)
 
-                    minutes_worked = np.where(
-                        hh > cur_h, 0,
-                        np.where(hh < s_h, 0, np.where(hh == s_h, np.maximum(0, end_m_arr - s_m), end_m_arr))
-                    ).astype(float)
+                        # 這個小時目前可以算到哪個分鐘（若是當前小時，用 now 的分鐘＋秒；否則到 seg_e）
+                        now_min_float = float(cur_m) + float(cur_s) / 60.0
+                        eff_e = np.where(hh == cur_h, np.minimum(now_min_float, seg_e), seg_e)
 
-                    hourly_full["本小時有效分鐘"] = minutes_worked
-                    hourly_full["本小時目標"] = (minutes_worked / 60.0) * float(target_hr)
-                    hourly_full["狀態"] = np.where(
-                        hourly_full["本小時有效分鐘"] <= 0,
-                        None,
-                        np.where(hourly_full["當小時加權PCS"] >= hourly_full["本小時目標"], STATUS_PASS, STATUS_FAIL)
-                    )
+                        p_s = np.where(hh == s_h, s_m.astype(float), 0.0)
+                        mins = np.where(
+                            hh > cur_h, 0.0,
+                            np.where(
+                                hh < s_h, 0.0,
+                                np.maximum(0.0, eff_e - np.maximum(seg_s, p_s))
+                            )
+                        )
 
-                    render_hourly_heatmap(
-                        hourly_full[["線別", "段數", "姓名", "小時", "當小時加權PCS", "本小時目標", "狀態"]].copy(),
-                        hour_cols=hour_cols,
-                        title=f"{line}｜每小時（12/13=30分）"
-                    )
+                        hourly_full["本小時有效分鐘"] = mins
+                        hourly_full["本小時目標"] = (mins / 60.0) * float(target_hr)
+                        hourly_full["狀態"] = np.where(
+                            hourly_full["本小時有效分鐘"] <= 1e-12,
+                            None,
+                            np.where(hourly_full["當小時加權PCS"] >= hourly_full["本小時目標"], STATUS_PASS, STATUS_FAIL),
+                        )
+
+                        render_hourly_heatmap(
+                            hourly_full[["線別", "段數", "姓名", "小時", "當小時加權PCS", "本小時目標", "狀態"]].copy(),
+                            hour_cols=hour_cols,
+                            title=f"{line}｜每小時（午休 12:30–13:30）"
+                        )
 
         st.divider()
         st.markdown("## 匯出 Excel（保留公式＋色塊自動更新）")
