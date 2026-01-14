@@ -408,9 +408,6 @@ def render_person_realtime_board(board_df: pd.DataFrame):
     )
 
     show = board_df.copy()
-
-    # ✅ 核心修正：段數固定 1→2→3→4（第一順位）
-    # 段內仍保留未達標優先（第二順位）
     show = show.sort_values(["段數", "排序_未達標優先", "姓名"], ascending=[True, True, True])
 
     for _, r in show.iterrows():
@@ -482,42 +479,13 @@ def main():
         "王建成": "09:00",
     }
 
+    # ✅ Sidebar 只保留必要設定（你要移除的「截止時間/自動刷新/立即刷新」整段已刪掉）
     with st.sidebar:
         st.markdown("### 設定")
         target_hr = st.number_input("每小時目標（加權PCS/小時）", min_value=1.0, value=790.0, step=10.0)
         hour_min = st.number_input("起始小時（Heatmap 用）", min_value=0, max_value=23, value=8, step=1)
         lookback_min = st.number_input("只保留最近N分鐘資料（避免太大）", min_value=10, max_value=24 * 60, value=180, step=10)
-
-        st.divider()
-        st.markdown("### 截止時間（避免『沒有資料』）")
-        use_data_latest_as_now = st.toggle("用『資料最新時間』當作判斷截止", value=True)
-        if not use_data_latest_as_now:
-            use_now = st.toggle("用現在時間（台北時間）", value=True)
-            if use_now:
-                manual_now = datetime.now(TPE)
-            else:
-                t_in = st.time_input("手動指定截止時間（台北時間）", value=datetime.now(TPE).time())
-                manual_now = datetime.combine(date.today(), t_in).replace(tzinfo=TPE)
-        else:
-            manual_now = None
-
-        st.divider()
-        st.markdown("### 自動刷新")
-        auto_refresh = st.toggle("自動刷新（建議 10~30 秒）", value=True)
-        refresh_sec = st.number_input("刷新秒數", min_value=5, max_value=120, value=15, step=5)
-
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            HAS_AUTOREFRESH = True
-        except Exception:
-            HAS_AUTOREFRESH = False
-
-        if auto_refresh and HAS_AUTOREFRESH:
-            st_autorefresh(interval=int(refresh_sec) * 1000, key="__29_autorefresh")
-        elif auto_refresh and not HAS_AUTOREFRESH:
-            st.warning("未安裝 streamlit-autorefresh（可在 requirements.txt 加：streamlit-autorefresh）")
-
-        manual = st.button("🔄 立即刷新/重算", type="primary", use_container_width=True)
+        st.caption("本頁固定用『資料最新時間』作為判斷截止（避免沒有資料）。")
 
     prod_files = st.file_uploader(
         "① 上傳『WMS 生產資料』（可多檔：CSV/TXT/XLS/XLSX；可全選上傳）",
@@ -529,18 +497,6 @@ def main():
     if not prod_files or mem_file is None:
         st.info("請上傳：① WMS 生產資料（可多檔） + ② 人員名單")
         return
-
-    prod_sig = "-".join([f"{f.name}:{f.size}" for f in prod_files])
-    mem_sig = f"{mem_file.name}:{mem_file.size}"
-    settings_sig = f"{target_hr}-{hour_min}-{lookback_min}-{use_data_latest_as_now}-{(manual_now.hour if manual_now else 'X')}-{(manual_now.minute if manual_now else 'X')}"
-
-    last = st.session_state.get("_29_last_sig_cloud_tabs", None)
-    cur_sig = (prod_sig, mem_sig, settings_sig)
-    should_run = manual or (last != cur_sig)
-    if not should_run:
-        st.caption("（目前結果已是最新；上傳檔案/設定變更會自動同步）")
-        return
-    st.session_state["_29_last_sig_cloud_tabs"] = cur_sig
 
     try:
         # 人員名單解析
@@ -629,26 +585,17 @@ def main():
 
         df_in = df[df["納入計算"]].copy()
 
-        # 判斷截止時間：用資料最新時間 or 手動/現在
-        if use_data_latest_as_now:
-            eval_now = max_ts
-            now_h, now_m = int(eval_now.hour), int(eval_now.minute)
-            now_str = f"{eval_now.strftime('%Y-%m-%d %H:%M')}(資料最新)"
-        else:
-            eval_now = manual_now
-            now_h, now_m = int(eval_now.hour), int(eval_now.minute)
-            now_str = f"{eval_now.strftime('%Y-%m-%d %H:%M')}(手動/現在)"
+        # ✅ 固定用資料最新時間當截止（避免沒有資料）
+        eval_now = max_ts
+        cur_h, cur_m = int(eval_now.hour), int(eval_now.minute)
 
         st.caption(
             f"資料時間：{cutoff.strftime('%Y-%m-%d %H:%M')} ～ {max_ts.strftime('%Y-%m-%d %H:%M')}｜"
-            f"判斷截止：{now_str}｜來源檔：{df_in['__source__'].nunique()} 個｜"
-            f"（12/13 小時只算 30 分鐘）"
+            f"判斷截止：{eval_now.strftime('%Y-%m-%d %H:%M')}（資料最新）｜"
+            f"來源檔：{df_in['__source__'].nunique()} 個｜（12/13 小時只算 30 分鐘）"
         )
 
         # 本小時 / 累積（每線×每段）
-        cur_h = int(now_h)
-        cur_m = int(now_m)
-
         hourly_person = (
             df_in[df_in["小時"] == cur_h]
             .groupby(["線別", "段數"], as_index=False)["加權PCS"].sum()
@@ -700,7 +647,6 @@ def main():
             st.info("沒有線別資料")
             return
 
-        # ✅ 段數固定 1~4
         all_zones = [1, 2, 3, 4]
 
         c1, c2, c3, c4 = st.columns([2.2, 1.3, 2.2, 1.3])
@@ -744,7 +690,6 @@ def main():
                 c.metric("未達標 人數", f)
                 d.metric("達標率", (f"{rate:.1f}%" if rate is not None else "—"))
 
-                # ✅ 核心修正：段數固定 1→2→3→4（第一順位）
                 df_line = df_line.sort_values(["段數", "排序_未達標優先", "姓名"], ascending=[True, True, True]).head(int(topn))
                 render_person_realtime_board(df_line)
 
